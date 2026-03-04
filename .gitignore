@@ -1,0 +1,4 @@
+chroma_db/
+chroma_manifest.json
+__pycache__/
+scripts/__pycache__/

@@ -1,0 +1,16 @@
+{
+  "name": "cricket-chat-backend",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "chroma:build": "python scripts/build_chroma_local.py --reset",
+    "chroma:query": "python scripts/query_chroma_local.py"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "csv-parser": "^3.2.0",
+    "express": "^4.19.2"
+  }
+}
