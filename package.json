@@ -5,6 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "test:cases": "node scripts/test-cases.js",
     "chroma:build": "python scripts/build_chroma_local.py --reset",
     "chroma:query": "python scripts/query_chroma_local.py"
   },

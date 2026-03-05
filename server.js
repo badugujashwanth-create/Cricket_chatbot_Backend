@@ -1,185 +1,165 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const csvAnalytics = require('./csvAnalytics');
-const chromaSearch = require('./chromaSearch');
-const cricketAssistant = require('./cricketAssistant');
-const liveCricketService = require('./liveCricketService');
-const {
-  players,
-  matches,
-  teams,
-  insights,
-  metrics,
-  findPlayerByName,
-  findTeamByName,
-  getRecentMatchesForTeam,
-  getRelatedMatchesForPlayer,
-  getMatchHighlights
-} = require('./data');
+const datasetStore = require('./datasetStore');
+const { handleQuery } = require('./queryService');
 
 const app = express();
-const port = process.env.PORT || 3000;
+const port = Number(process.env.PORT || 3000);
 const frontendPath = path.join(__dirname, '../frontend');
 
 app.use(cors());
 app.use(express.json());
 app.use(express.static(frontendPath));
 
-const summaryPayload = {
-  matches: matches.length,
-  players: players.length,
-  teams: teams.length,
-  metrics: metrics.length,
-  insights: insights.length
-};
-
-csvAnalytics.startIndexing().catch((error) => {
-  console.error('CSV analytics indexing failed:', error.message);
+datasetStore.start().catch((error) => {
+  console.error('Failed to load dataset:', error.message);
 });
 
-app.get('/api/summary', (req, res) => {
-  const summary = csvAnalytics.summarizeForDashboard(summaryPayload);
-  if (!csvAnalytics.getCache()) {
-    const status = csvAnalytics.getStatus();
-    summary.index_status = status.status;
-    if (status.rowsProcessed) {
-      summary.rows_indexed_so_far = status.rowsProcessed;
-    }
+app.get('/api/about', async (req, res) => {
+  await datasetStore.waitUntilReady(60000);
+  const about = datasetStore.getAbout();
+  if (!about) {
+    return res.status(503).json({
+      message: 'Data is loading. Please try again in a moment.'
+    });
   }
-  res.json(summary);
+  return res.json(about);
 });
 
-app.get('/api/players', (req, res) => {
-  res.json(csvAnalytics.toDashboardPlayers(6) || players);
-});
-
-app.get('/api/players/:id', (req, res) => {
-  const target = players.find((player) => player.id === req.params.id);
-  if (!target) {
-    return res.status(404).json({ message: 'Player not found' });
+app.get('/api/home', async (req, res) => {
+  await datasetStore.waitUntilReady(60000);
+  const data = datasetStore.getHomeData();
+  if (!data) {
+    return res.status(503).json({
+      message: 'Data is loading. Please try again in a moment.'
+    });
   }
-  res.json(target);
+  return res.json(data);
 });
 
-app.get('/api/matches', (req, res) => {
-  const requested = Math.min(10, Math.max(1, parseInt(req.query.limit, 10) || 4));
-  res.json(csvAnalytics.toDashboardMatches(requested) || getMatchHighlights(requested));
+app.get('/api/players/search', async (req, res) => {
+  await datasetStore.waitUntilReady(60000);
+  const result = datasetStore.searchPlayers({
+    q: req.query.q || '',
+    page: Number(req.query.page || 1),
+    limit: Number(req.query.limit || 12)
+  });
+  if (!result) {
+    return res.status(503).json({
+      message: 'Data is loading. Please try again in a moment.'
+    });
+  }
+  return res.json(result);
 });
 
-app.get('/api/metrics', (req, res) => {
-  res.json(csvAnalytics.toDashboardMetrics(metrics));
-});
-
-app.get('/api/insights', (req, res) => {
-  res.json(insights);
-});
-
-app.get('/api/index-status', (req, res) => {
-  res.json({
-    ...csvAnalytics.getStatus(),
-    chroma: chromaSearch.getStatus(),
-    live: liveCricketService.getStatus()
+app.get('/api/players/:id', async (req, res) => {
+  await datasetStore.waitUntilReady(60000);
+  const player = datasetStore.getPlayerById(req.params.id);
+  if (!player) {
+    return res.status(404).json({
+      message: 'Player not found.'
+    });
+  }
+  return res.json({
+    id: player.id,
+    name: player.name,
+    team: player.team,
+    stats: player.stats,
+    recent_matches: (player.stats?.recent_matches || []).slice(0, 5)
   });
 });
 
-app.get('/api/live/status', (req, res) => {
-  res.json(liveCricketService.getStatus());
-});
-
-app.get('/api/live/score', async (req, res) => {
-  try {
-    const query = String(req.query.q || '').trim();
-    const force = String(req.query.force || '').toLowerCase() === 'true';
-    const snapshot = await liveCricketService.getSnapshot({ query, force });
-    res.json(snapshot);
-  } catch (error) {
-    console.error('Live score fetch failed:', error);
-    res.status(500).json({
-      available: false,
-      configured: liveCricketService.getStatus().configured,
-      message: 'Failed to fetch live score',
-      error: error.message
+app.get('/api/players/:id/summary', async (req, res) => {
+  await datasetStore.waitUntilReady(60000);
+  const summary = datasetStore.getPlayerSummary(req.params.id, {
+    season: req.query.season || '',
+    format: req.query.format || ''
+  });
+  if (!summary) {
+    return res.status(404).json({
+      message: 'Player stats not found.'
     });
   }
+  return res.json(summary);
+});
+
+app.get('/api/teams/search', async (req, res) => {
+  await datasetStore.waitUntilReady(60000);
+  const result = datasetStore.searchTeams(String(req.query.q || ''));
+  if (!result) {
+    return res.status(503).json({
+      message: 'Data is loading. Please try again in a moment.'
+    });
+  }
+  return res.json(result);
+});
+
+app.get('/api/options', async (req, res) => {
+  await datasetStore.waitUntilReady(60000);
+  const about = datasetStore.getAbout();
+  const teams = datasetStore.searchTeams('');
+  if (!about || !teams) {
+    return res.status(503).json({
+      message: 'Data is loading. Please try again in a moment.'
+    });
+  }
+  return res.json({
+    teams: teams.map((team) => team.name),
+    seasons: about.seasons || [],
+    venues: about.venues || []
+  });
+});
+
+app.get('/api/matches', async (req, res) => {
+  await datasetStore.waitUntilReady(60000);
+  const result = datasetStore.getMatches({
+    team: req.query.team || '',
+    season: req.query.season || '',
+    venue: req.query.venue || '',
+    limit: Number(req.query.limit || 10),
+    offset: Number(req.query.offset || 0)
+  });
+  if (!result) {
+    return res.status(503).json({
+      message: 'Data is loading. Please try again in a moment.'
+    });
+  }
+  return res.json(result);
+});
+
+app.get('/api/matches/:id', async (req, res) => {
+  await datasetStore.waitUntilReady(60000);
+  const match = datasetStore.getMatchById(req.params.id);
+  if (!match) {
+    return res.status(404).json({
+      message: 'Match not found.'
+    });
+  }
+  return res.json(match);
 });
 
 app.post('/api/query', async (req, res) => {
   try {
-    const result = await cricketAssistant.handleQuery(req.body || {});
-    if (!result.success) {
-      return res.status(result.statusCode || 400).json(result);
-    }
-    res.json(result);
+    const outcome = await handleQuery(req.body || {});
+    return res.status(outcome.statusCode || 200).json(outcome.response);
   } catch (error) {
-    console.error('Query handling failed:', error);
-    res.status(500).json({ success: false, message: 'Failed to process query' });
+    console.error('Query failed:', error);
+    return res.status(500).json({
+      answer: 'Something went wrong while processing the question.',
+      data: {},
+      followups: []
+    });
   }
 });
 
 app.get('*', (req, res) => {
   if (req.path.startsWith('/api')) {
-    return res.status(404).json({ message: 'Endpoint not found' });
+    return res.status(404).json({ message: 'Endpoint not found.' });
   }
-  res.sendFile(path.join(frontendPath, 'index.html'));
+  return res.sendFile(path.join(frontendPath, 'index.html'));
 });
 
 app.listen(port, () => {
-  console.log(`Cricket chat backend listening on http://localhost:${port}`);
+  console.log(`Server running on http://localhost:${port}`);
 });
-
-function avgRecent(scores = []) {
-  if (!scores.length) return 0;
-  return scores.reduce((sum, value) => sum + value, 0) / scores.length;
-}
-
-function craftPlayerSummary(player) {
-  const recentAvg = avgRecent(player.stats.recentScores || []);
-  const consistency = recentAvg > player.stats.average ? 'above' : 'around';
-  return `${player.name} averages ${player.stats.average} (${player.stats.matches} matches) and is currently performing ${consistency} career form with last five innings averaging ${recentAvg.toFixed(1)}.`;
-}
-
-function parseComparisonQuery(query) {
-  const text = String(query || '').trim();
-  if (!text) return null;
-
-  const vsMatch = text.match(/^(.+?)\s+vs\s+(.+)$/i);
-  if (vsMatch) {
-    return { left: vsMatch[1].trim(), right: vsMatch[2].trim() };
-  }
-
-  const compareMatch = text.match(/^compare\s+(.+?)\s+(?:with|and)\s+(.+)$/i);
-  if (compareMatch) {
-    return { left: compareMatch[1].trim(), right: compareMatch[2].trim() };
-  }
-
-  return null;
-}
-
-function craftComparisonSummary(left, right) {
-  const leftRecent = avgRecent(left.stats.recentScores || []);
-  const rightRecent = avgRecent(right.stats.recentScores || []);
-  const formLeader = leftRecent === rightRecent ? null : leftRecent > rightRecent ? left.name : right.name;
-  const avgLeader =
-    typeof left.stats.average === 'number' && typeof right.stats.average === 'number'
-      ? left.stats.average === right.stats.average
-        ? null
-        : left.stats.average > right.stats.average
-          ? left.name
-          : right.name
-      : null;
-
-  const formLine = formLeader ? `${formLeader} has the stronger recent five-innings form.` : 'Their recent form is very close.';
-  const avgLine = avgLeader ? `${avgLeader} leads on listed career average.` : 'Their listed averages are comparable in this sample.';
-  return `${left.name} vs ${right.name}: ${avgLine} ${formLine}`;
-}
-
-function craftTeamSummary(team) {
-  const recent = getRecentMatchesForTeam(team.name, 3);
-  if (!recent.length) {
-    return `${team.name} is profiled with ${team.captain} as captain and ${team.coach} as coach, but no recent sample matches are indexed yet.`;
-  }
-
-  const wins = recent.filter((match) => match.result.toLowerCase().startsWith(team.name.toLowerCase())).length;
-  return `${team.name} (${team.region}) is captained by ${team.captain}. In the latest ${recent.length} indexed matches, they won ${wins}.`;
-}

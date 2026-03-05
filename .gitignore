@@ -1,3 +1,6 @@
+node_modules/
+*.log
+.env
 chroma_db/
 chroma_manifest.json
 __pycache__/
