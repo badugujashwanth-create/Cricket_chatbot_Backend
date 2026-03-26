@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.env
+chroma_db/
+chroma_manifest.json
+cleaned_balls_all_matches.csv
+cleaned_dataset_manifest.json
+__pycache__/
+scripts/__pycache__/
