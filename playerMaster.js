@@ -6,11 +6,13 @@ const { normalizeText, tokenize } = require('./textUtils');
 const PLAYER_MASTER_PATH = path.join(__dirname, 'player_master.json');
 
 let aliasMap = null;
+let canonicalAliasMap = null;
 
 function loadAliasMap() {
   if (aliasMap) return aliasMap;
 
   const map = new Map();
+  const reverseMap = new Map();
   if (fs.existsSync(PLAYER_MASTER_PATH)) {
     try {
       const payload = JSON.parse(fs.readFileSync(PLAYER_MASTER_PATH, 'utf8'));
@@ -20,6 +22,11 @@ function loadAliasMap() {
         if (!cleanAlias || !cleanCanonical) continue;
         map.set(cleanAlias, cleanCanonical);
         map.set(normalizeText(cleanCanonical), cleanCanonical);
+        const reverseKey = normalizeText(cleanCanonical);
+        const aliasSet = reverseMap.get(reverseKey) || new Set();
+        aliasSet.add(String(alias || '').trim());
+        aliasSet.add(cleanCanonical);
+        reverseMap.set(reverseKey, aliasSet);
       }
     } catch (_) {
       // Fall back to generated aliases only when the manual map is unreadable.
@@ -27,11 +34,18 @@ function loadAliasMap() {
   }
 
   aliasMap = map;
+  canonicalAliasMap = reverseMap;
   return aliasMap;
 }
 
 function getCanonicalPlayerName(value = '') {
   return loadAliasMap().get(normalizeText(value || '')) || '';
+}
+
+function getManualAliasesForCanonical(value = '') {
+  loadAliasMap();
+  const canonical = getCanonicalPlayerName(value) || String(value || '').trim();
+  return [...(canonicalAliasMap?.get(normalizeText(canonical)) || new Set())];
 }
 
 function addNameVariants(target, value = '') {
@@ -61,6 +75,7 @@ function buildPlayerAliases(name = '') {
   if (canonical) {
     addNameVariants(aliases, canonical);
   }
+  getManualAliasesForCanonical(name).forEach((alias) => addNameVariants(aliases, alias));
   return [...aliases];
 }
 

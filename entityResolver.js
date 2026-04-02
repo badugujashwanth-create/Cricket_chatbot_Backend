@@ -45,6 +45,33 @@ function playerDisplayName(name = '') {
   return getCanonicalPlayerName(name) || name;
 }
 
+function entityPriority(type = 'player', row = {}) {
+  const cache = typeof datasetStore.getCache === 'function' ? datasetStore.getCache() : null;
+  if (!cache) return 0;
+
+  if (type === 'player') {
+    const player = cache.playerMapById?.get?.(row.id);
+    const stats = player?.stats || {};
+    return (
+      Number(stats.runs || 0) * 10 +
+      Number(stats.wickets || 0) * 25 +
+      Number(stats.matches || 0)
+    );
+  }
+
+  if (type === 'team') {
+    const team = cache.teamMapById?.get?.(row.id);
+    const stats = team?.stats || {};
+    return (
+      Number(stats.wins || 0) * 50 +
+      Number(stats.matches || 0) * 5 +
+      Number(stats.runs || 0) / 100
+    );
+  }
+
+  return 0;
+}
+
 function scoreCandidate(query = '', candidate = '', type = 'player') {
   const q = normalizeText(query);
   const c = normalizeText(candidate);
@@ -56,8 +83,18 @@ function scoreCandidate(query = '', candidate = '', type = 'player') {
   const singleTokenPlayerQuery = type === 'player' && qTokens.length === 1 && cTokens.length > 1;
 
   let score = 0;
+  if (singleTokenPlayerQuery) {
+    const token = qTokens[0];
+    if (cTokens[0] === token) {
+      score = Math.max(score, 0.98);
+    } else if (cTokens.includes(token)) {
+      score = Math.max(score, 0.9);
+    } else if (c.startsWith(`${token} `)) {
+      score = Math.max(score, 0.88);
+    }
+  }
   if (c.includes(q)) {
-    score = Math.max(score, singleTokenPlayerQuery ? 0.74 : 0.88);
+    score = Math.max(score, singleTokenPlayerQuery ? 0.62 : 0.88);
   }
   if (q.includes(c)) score = Math.max(score, 0.82);
 
@@ -85,8 +122,8 @@ function scoreCandidate(query = '', candidate = '', type = 'player') {
   }
 
   let fuzzy = similarityScore(q, c);
-  if (singleTokenPlayerQuery) {
-    fuzzy = Math.min(fuzzy, 0.76);
+  if (singleTokenPlayerQuery && !cTokens.includes(qTokens[0])) {
+    fuzzy = Math.min(fuzzy, 0.66);
   }
   score = Math.max(score, fuzzy);
   return score;
@@ -106,10 +143,14 @@ function rankEntities(type, query) {
             ? makePlayerAliases(row.name)
             : row.aliases || [row.name];
       const best = aliases.reduce((max, alias) => Math.max(max, scoreCandidate(query, alias, type)), 0);
-      return { row, score: best };
+      return {
+        row,
+        score: best,
+        priority: entityPriority(type, row)
+      };
     })
     .filter((row) => row.score >= 0.45)
-    .sort((a, b) => b.score - a.score || a.row.name.localeCompare(b.row.name));
+    .sort((a, b) => b.score - a.score || b.priority - a.priority || a.row.name.localeCompare(b.row.name));
 }
 
 function getEntityAliases(type, row = {}) {
@@ -125,6 +166,8 @@ function resolveEntity(type, query) {
   if (!index) return { status: 'not_found' };
   const rows = type === 'player' ? index.players : type === 'team' ? index.teams : index.venues;
   const normalizedQuery = normalizeText(text);
+  const queryTokens = tokenize(normalizedQuery);
+  const singleTokenQuery = queryTokens.length === 1;
 
   const exactMatches = rows.filter((row) =>
     getEntityAliases(type, row).some((alias) => normalizeText(alias) === normalizedQuery)
@@ -144,6 +187,27 @@ function resolveEntity(type, query) {
     };
   }
   if (exactMatches.length > 1) {
+    const exactRanked = exactMatches
+      .map((row) => ({
+        row,
+        score: getEntityAliases(type, row).reduce((max, alias) => Math.max(max, scoreCandidate(text, alias, type)), 0),
+        priority: entityPriority(type, row)
+      }))
+      .sort((a, b) => b.score - a.score || b.priority - a.priority || a.row.name.localeCompare(b.row.name));
+    const best = exactRanked[0]?.row;
+    if (best) {
+      return {
+        status: 'resolved',
+        item:
+          type === 'player'
+            ? {
+                ...best,
+                dataset_name: best.name,
+                canonical_name: playerDisplayName(best.name)
+              }
+            : best
+      };
+    }
     return {
       status: 'clarify',
       query: text,
@@ -155,19 +219,12 @@ function resolveEntity(type, query) {
   if (!ranked.length) return { status: 'not_found' };
 
   const top = ranked[0];
-  const second = ranked[1];
-  const strongThreshold = type === 'team' ? 0.8 : 0.78;
-  const gapThreshold = 0.08;
+  const strongThreshold =
+    type === 'team'
+      ? singleTokenQuery ? 0.62 : 0.8
+      : singleTokenQuery ? 0.58 : 0.78;
 
   if (!top || top.score < strongThreshold) {
-    return {
-      status: 'clarify',
-      query: text,
-      choices: [...new Set(ranked.slice(0, 6).map((entry) => type === 'player' ? playerDisplayName(entry.row.name) : entry.row.name))]
-    };
-  }
-
-  if (second && Math.abs(top.score - second.score) <= gapThreshold) {
     return {
       status: 'clarify',
       query: text,

@@ -116,10 +116,33 @@ function detectFormat(question = '') {
 
 function detectTopMetric(question = '') {
   const text = normalizeText(question);
+  if (/\bmost six(?:es)?\b|\bbig hitters?\b|\bpower hitters?\b/.test(text)) return 'sixes';
+  if (/\bmost four(?:s)?\b/.test(text)) return 'fours';
+  if (/\bfastest\s+(?:50|fifty|100|century)\b|\bquickest\s+(?:50|fifty|100|century)\b|\bmost aggressive batting\b/.test(text)) {
+    return 'strike_rate';
+  }
   if (/\bwickets?\b/.test(text)) return 'wickets';
   if (/\bstrike rate\b|\bsr\b/.test(text)) return 'strike_rate';
   if (/\beconomy\b/.test(text)) return 'economy';
   return 'runs';
+}
+
+function isSubjectiveQuestion(question = '') {
+  return /\b(why|best ever|greatest|goat|overrated|prediction|predict|choke|inconsistent|strongest|stronger|better|more dangerous|who will win)\b/.test(
+    normalizeText(question)
+  );
+}
+
+function isTeamInfoQuestion(question = '') {
+  return /\b(troph(?:y|ies)|captain|coach|owner|history|founded|home ground|franchise|won in wc history|world cup history)\b/.test(
+    normalizeText(question)
+  );
+}
+
+function isRecordQuestion(question = '') {
+  return /\b(highest score|lowest total|fastest century|fastest 100|most wickets in world cup|most wickets|highest strike rate ever|record|records)\b/.test(
+    normalizeText(question)
+  );
 }
 
 function extractSeason(question = '') {
@@ -140,9 +163,21 @@ function fallbackRoute(question = '') {
   const vs = parseVsSides(raw);
 
   if (!raw) return { action: 'not_supported' };
+  if (/^(hi|hello|hey|hii|heya|how are you|who are you|thanks|thank you)\b/i.test(q)) {
+    return { action: 'chit_chat' };
+  }
 
-  if (/\b(captain|coach|history|best ever|greatest of all time|goat)\b/.test(q)) {
-    return { action: 'not_supported' };
+  if (isRecordQuestion(raw)) {
+    return {
+      action: 'record_lookup',
+      metric: detectTopMetric(raw),
+      season,
+      format
+    };
+  }
+
+  if (/\b(coach|history)\b/.test(q)) {
+    return { action: 'team_info', team: raw, season, format };
   }
 
   if (/\b(live|current|ongoing|today|latest|schedule|scheduled match(?:es)?|fixture|fixtures|upcoming|next match|next game|tomorrow|when is|who is playing today)\b/.test(q)) {
@@ -157,7 +192,11 @@ function fallbackRoute(question = '') {
     }
   }
 
-  if (/\b(top|most|highest|best)\b/.test(q) && /\b(run|runs|wickets?|strike rate|sr|economy)\b/.test(q)) {
+  if (
+    (/\b(top|most|highest|best|fastest|quickest)\b/.test(q) &&
+      /\b(run|runs|wickets?|strike rate|sr|economy|six(?:es)?|four(?:s)?|century|fifty|50|100)\b/.test(q)) ||
+    /\bmost aggressive batting\b/.test(q)
+  ) {
     return {
       action: 'top_players',
       metric: detectTopMetric(raw),
@@ -177,6 +216,15 @@ function fallbackRoute(question = '') {
   }
 
   if (/\bcompare\b/.test(q) || /\bvs\b|\bversus\b/.test(q)) {
+    if (/\b(team|lineup|attack|captaincy|captain|overall)\b/.test(q)) {
+      return {
+        action: 'subjective_analysis',
+        team1: vs?.left || '',
+        team2: vs?.right || '',
+        season,
+        format
+      };
+    }
     return {
       action: 'compare_players',
       player1: vs?.left || '',
@@ -201,8 +249,39 @@ function fallbackRoute(question = '') {
     return { action: 'team_stats', team: raw, season, format };
   }
 
+  if (isTeamInfoQuestion(raw)) {
+    return {
+      action: 'team_info',
+      team: raw,
+      team1: vs?.left || '',
+      team2: vs?.right || '',
+      season,
+      format
+    };
+  }
+
+  if (isSubjectiveQuestion(raw)) {
+    return {
+      action: 'subjective_analysis',
+      player1: vs?.left || '',
+      player2: vs?.right || '',
+      team1: vs?.left || '',
+      team2: vs?.right || '',
+      season,
+      format
+    };
+  }
+
   if (season) {
     return { action: 'player_season_stats', player: raw, season, format };
+  }
+
+  if (/\b(best|top)\s+(bowler|bolwer|batsman|batter|finisher|player|all rounder|allrounder)\b/.test(q)) {
+    return {
+      action: 'subjective_analysis',
+      season,
+      format
+    };
   }
 
   return { action: 'player_stats', player: raw, format };
@@ -256,7 +335,7 @@ function buildSystemPrompt() {
     'You are a cricket query router.',
     'Return ONLY one JSON object. No markdown. No explanation.',
     'Allowed actions:',
-    'player_stats, player_season_stats, team_stats, match_summary, compare_players, head_to_head, top_players, glossary, not_supported',
+    'player_stats, player_season_stats, team_stats, team_info, match_summary, compare_players, head_to_head, top_players, record_lookup, glossary, chit_chat, subjective_analysis, not_supported',
     'Use these optional keys when relevant:',
     'player, player1, player2, team, team1, team2, season, format, match_id, date, metric, term, limit, min_balls, min_overs',
     'Rules:',
@@ -265,8 +344,12 @@ function buildSystemPrompt() {
     '3) Compare two players -> compare_players with player1 and player2.',
     '4) Team-vs-team record -> head_to_head with team1 and team2.',
     '5) Rankings/top lists -> top_players with metric.',
+    '5b) Team trophy/captain/history questions -> team_info.',
+    '5c) Record questions like highest score or fastest century -> record_lookup.',
     '6) Stat term meaning -> glossary with term.',
-    '7) If not answerable from structured cricket data, use not_supported.'
+    '7) Greetings, thanks, introductions, and small talk -> chit_chat.',
+    '8) Opinions, predictions, debate framing, or abstract reasons -> subjective_analysis unless the question clearly compares two named players or two named teams.',
+    '9) If not answerable from structured cricket data, use not_supported.'
   ].join('\n');
 }
 
@@ -288,6 +371,11 @@ function buildUserPrompt(question, context = {}) {
 }
 
 async function routeQuestion(question, context = {}) {
+  const heuristicRoute = fallbackRoute(question);
+  if (['chit_chat', 'subjective_analysis', 'top_players', 'glossary', 'team_info', 'record_lookup'].includes(heuristicRoute.action)) {
+    return heuristicRoute;
+  }
+
   const messages = [
     { role: 'system', content: buildSystemPrompt() },
     { role: 'user', content: buildUserPrompt(question, context) }

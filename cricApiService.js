@@ -13,6 +13,7 @@ const CACHE_TTL = {
   live: 30 * 1000,
   players: 15 * 60 * 1000,
   playerInfo: 60 * 60 * 1000,
+  scorecard: 60 * 60 * 1000,
   schedule: 15 * 60 * 1000,
   series: 30 * 60 * 1000,
   seriesInfo: 15 * 60 * 1000
@@ -192,6 +193,51 @@ function normalizeMatch(match = {}) {
     has_squad: Boolean(match.hasSquad),
     fantasy_enabled: Boolean(match.fantasyEnabled),
     ball_by_ball_enabled: Boolean(match.bbbEnabled)
+  };
+}
+
+function normalizeScorecardPlayer(player = {}) {
+  return {
+    id: String(player.id || ''),
+    name: String(player.name || '')
+  };
+}
+
+function normalizeScorecardBatting(row = {}) {
+  return {
+    batsman: normalizeScorecardPlayer(row.batsman || {}),
+    dismissal: String(row.dismissal || ''),
+    dismissal_text: String(row['dismissal-text'] || row.dismissal_text || ''),
+    bowler: normalizeScorecardPlayer(row.bowler || {}),
+    catcher: normalizeScorecardPlayer(row.catcher || {}),
+    runs: Number(row.r || 0),
+    balls: Number(row.b || 0),
+    fours: Number(row['4s'] || 0),
+    sixes: Number(row['6s'] || 0),
+    strike_rate: Number.isFinite(Number(row.sr)) ? Number(row.sr) : null
+  };
+}
+
+function normalizeScorecardBowling(row = {}) {
+  return {
+    bowler: normalizeScorecardPlayer(row.bowler || {}),
+    overs: Number.isFinite(Number(row.o)) ? Number(row.o) : 0,
+    maidens: Number(row.m || 0),
+    runs_conceded: Number(row.r || 0),
+    wickets: Number(row.w || 0),
+    noballs: Number(row.nb || 0),
+    wides: Number(row.wd || 0),
+    economy: Number.isFinite(Number(row.eco)) ? Number(row.eco) : null
+  };
+}
+
+function normalizeScorecardInning(row = {}) {
+  return {
+    inning: String(row.inning || ''),
+    batting: Array.isArray(row.batting) ? row.batting.map(normalizeScorecardBatting) : [],
+    bowling: Array.isArray(row.bowling) ? row.bowling.map(normalizeScorecardBowling) : [],
+    extras: row.extras && typeof row.extras === 'object' ? row.extras : {},
+    totals: row.totals && typeof row.totals === 'object' ? row.totals : {}
   };
 }
 
@@ -381,6 +427,52 @@ async function getPlayerInfo(playerId = '') {
   };
 }
 
+async function getMatchScorecard(matchId = '') {
+  const id = String(matchId || '').trim();
+  if (!id) {
+    throw new CricApiError('Match id is required.', 400, {
+      provider: 'cricapi',
+      source: 'external'
+    });
+  }
+
+  const payload = await requestCricApi(
+    'match_scorecard',
+    { offset: 0, id },
+    {
+      cacheKey: `cricapi:match_scorecard:${id}`,
+      ttlMs: CACHE_TTL.scorecard
+    }
+  );
+
+  const data = payload.data && typeof payload.data === 'object' ? payload.data : {};
+  return {
+    provider: 'cricapi',
+    source: 'external',
+    match: {
+      source: 'cricapi',
+      id: String(data.id || ''),
+      name: String(data.name || ''),
+      match_type: String(data.matchType || ''),
+      status: String(data.status || ''),
+      venue: String(data.venue || ''),
+      date: String(data.date || ''),
+      date_time_gmt: String(data.dateTimeGMT || ''),
+      teams: Array.isArray(data.teams) ? data.teams : [],
+      team_info: Array.isArray(data.teamInfo) ? data.teamInfo : [],
+      score: Array.isArray(data.score) ? data.score.map(normalizeScoreLine) : [],
+      toss_winner: String(data.tossWinner || ''),
+      toss_choice: String(data.tossChoice || ''),
+      match_winner: String(data.matchWinner || ''),
+      series_id: String(data.series_id || ''),
+      match_started: Boolean(data.matchStarted),
+      match_ended: Boolean(data.matchEnded),
+      scorecard: Array.isArray(data.scorecard) ? data.scorecard.map(normalizeScorecardInning) : []
+    },
+    meta: buildMeta(payload.info)
+  };
+}
+
 async function getMatchSchedule({
   offset = 0,
   limit = DEFAULT_LIMIT,
@@ -493,6 +585,7 @@ module.exports = {
   getLiveScores,
   searchPlayers,
   getPlayerInfo,
+  getMatchScorecard,
   getMatchSchedule,
   getSeriesList,
   getSeriesInfo

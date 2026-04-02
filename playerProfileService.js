@@ -135,8 +135,18 @@ async function getPlayerProfile({ query = '', datasetName = '' } = {}) {
   if (cached) return cached;
 
   const external = await fetchExternalPlayer(query, datasetName);
+  const preferredCanonical = chooseBaseCanonicalName(query, datasetName);
+  const externalName = String(external?.name || '').trim();
+  const externalScore = externalName
+    ? Math.max(
+        similarityScore(preferredCanonical, externalName),
+        similarityScore(String(datasetName || '').trim(), externalName)
+      )
+    : 0;
   const canonicalName =
-    String(external?.name || '').trim() || chooseBaseCanonicalName(query, datasetName);
+    externalName && (!preferredCanonical || externalScore >= 0.82)
+      ? externalName
+      : preferredCanonical || externalName;
   const wiki = await fetchWikipediaSummary(canonicalName);
 
   return setCachedProfile(cacheKey, {

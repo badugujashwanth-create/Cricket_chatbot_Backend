@@ -5,8 +5,12 @@ const SUPPORTED_ACTIONS = [
   'match_summary',
   'compare_players',
   'head_to_head',
+  'team_info',
+  'record_lookup',
   'top_players',
   'glossary',
+  'chit_chat',
+  'subjective_analysis',
   'not_supported'
 ];
 

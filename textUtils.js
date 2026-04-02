@@ -102,14 +102,47 @@ function levenshtein(a = '', b = '') {
   for (let i = 1; i < rows; i += 1) {
     for (let j = 1; j < cols; j += 1) {
       const cost = s[i - 1] === t[j - 1] ? 0 : 1;
-      matrix[i][j] = Math.min(
+      let next = Math.min(
         matrix[i - 1][j] + 1,
         matrix[i][j - 1] + 1,
         matrix[i - 1][j - 1] + cost
       );
+      if (
+        i > 1 &&
+        j > 1 &&
+        s[i - 1] === t[j - 2] &&
+        s[i - 2] === t[j - 1]
+      ) {
+        next = Math.min(next, matrix[i - 2][j - 2] + cost);
+      }
+      matrix[i][j] = next;
     }
   }
   return matrix[rows - 1][cols - 1];
+}
+
+function typoAwareTokenScore(left = '', right = '') {
+  const a = normalizeText(left);
+  const b = normalizeText(right);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+
+  const len = Math.max(a.length, b.length);
+  const dist = levenshtein(a, b);
+  if (!len) return 0;
+
+  if (len > 5 && dist <= 2) {
+    let score = dist === 1 ? 0.92 : 0.87;
+    if (a[0] && b[0] && a[0] === b[0]) score += 0.03;
+    if (a.at(-1) && b.at(-1) && a.at(-1) === b.at(-1)) score += 0.02;
+    return Math.min(score, 0.97);
+  }
+
+  if (len > 3 && dist === 1) {
+    return 0.84;
+  }
+
+  return 0;
 }
 
 function similarityScore(a = '', b = '') {
@@ -126,8 +159,21 @@ function similarityScore(a = '', b = '') {
   const dist = levenshtein(left, right);
   const len = Math.max(left.length, right.length);
   const distanceScore = len ? 1 - dist / len : 0;
+  const typoScore =
+    len > 5 && dist <= 2
+      ? Math.max(distanceScore, typoAwareTokenScore(left, right))
+      : distanceScore;
 
   const substringScore = right.includes(left) || left.includes(right) ? 0.9 : 0;
+  const tokenTypoScore = leftTokens.length
+    ? leftTokens.reduce((total, token) => {
+        const best = rightTokens.reduce(
+          (max, candidate) => Math.max(max, typoAwareTokenScore(token, candidate)),
+          0
+        );
+        return total + best;
+      }, 0) / leftTokens.length
+    : 0;
 
   if (leftTokens.length >= 2 && rightTokens.length >= 2) {
     const leftFirst = leftTokens[0];
@@ -136,10 +182,10 @@ function similarityScore(a = '', b = '') {
     const rightLast = rightTokens[rightTokens.length - 1];
     const initialLastMatch =
       leftLast === rightLast && leftFirst[0] && rightFirst[0] && leftFirst[0] === rightFirst[0];
-    if (initialLastMatch) return Math.max(0.92, tokenScore, substringScore, distanceScore);
+    if (initialLastMatch) return Math.max(0.92, tokenScore, substringScore, typoScore, tokenTypoScore);
   }
 
-  return Math.max(tokenScore, substringScore, distanceScore);
+  return Math.max(tokenScore, substringScore, typoScore, tokenTypoScore);
 }
 
 module.exports = {

@@ -1,11 +1,9 @@
-const datasetStore = require('./datasetStore');
 const { routeQuestion, extractJsonFromText } = require('./llamaRouter');
 const { callLlama } = require('./llamaClient');
 const { queryVectorDb } = require('./chromaService');
-const { resolvePlayer, resolveTeam } = require('./entityResolver');
 const { getPlayerProfile } = require('./playerProfileService');
-const { executeAction, unavailableResult } = require('./statsService');
-const { NOT_AVAILABLE_MESSAGE, SUPPORTED_ACTIONS } = require('./constants');
+const { getSession, setPendingClarification, clearPendingClarification, updateContext } = require('./sessionStore');
+const { NOT_AVAILABLE_MESSAGE, SUPPORTED_ACTIONS, GLOSSARY } = require('./constants');
 const {
   CricApiConfigError,
   getLiveScores,
@@ -17,6 +15,16 @@ const {
 } = require('./cricApiService');
 const { normalizeText } = require('./textUtils');
 const { cleanEntitySegment, parseVsSides } = require('./queryParser');
+const {
+  loadMatchSummaries,
+  resolvePlayer: resolveVectorPlayer,
+  resolveTeam: resolveVectorTeam,
+  getTopPlayersByMetric,
+  getTopPlayersForTeam,
+  getMatchById: getVectorMatchById,
+  findMatchesByTeams,
+  findMatchesForTeam
+} = require('./vectorIndexService');
 
 const YEAR_REGEX = /\b(19\d{2}|20\d{2})\b/;
 const MATCH_ID_REGEX = /\b(\d{5,})\b/;
@@ -86,6 +94,22 @@ const GENERIC_WORDS = new Set([
   'wickets',
   'with'
 ]);
+const PLAYER_CONTEXT_PRONOUN_REGEX = /\b(he|him|his|she|her)\b/i;
+const TEAM_CONTEXT_PRONOUN_REGEX = /\b(they|them|their)\b/i;
+const wikipediaSummaryCache = new Map();
+const wikipediaWikitextCache = new Map();
+const NUMBER_WORDS = new Map([
+  ['one', 1],
+  ['two', 2],
+  ['three', 3],
+  ['four', 4],
+  ['five', 5],
+  ['six', 6],
+  ['seven', 7],
+  ['eight', 8],
+  ['nine', 9],
+  ['ten', 10]
+]);
 
 function pickFirst(...values) {
   for (const value of values) {
@@ -98,6 +122,23 @@ function pickFirst(...values) {
 
 function uniqueNonEmpty(values = []) {
   return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))];
+}
+
+function wordToNumber(value = '') {
+  const clean = normalizeText(value);
+  if (!clean) return null;
+  if (/^\d+$/.test(clean)) return Number(clean);
+  return NUMBER_WORDS.get(clean) ?? null;
+}
+
+function unavailableResult(message = NOT_AVAILABLE_MESSAGE) {
+  return {
+    answer: String(message || NOT_AVAILABLE_MESSAGE).trim() || NOT_AVAILABLE_MESSAGE,
+    data: {
+      type: 'summary'
+    },
+    followups: []
+  };
 }
 
 function formatStatValue(value) {
@@ -209,6 +250,22 @@ function buildKeyStats(details = {}) {
     ];
   }
 
+  if (type === 'team_info') {
+    const rows = [];
+    if (Number(details.stats?.ipl_titles || 0)) {
+      rows.push({ label: 'IPL Titles', value: Number(details.stats.ipl_titles || 0) });
+    }
+    if (Number(details.stats?.major_titles || 0)) {
+      rows.push({ label: 'Major Titles', value: Number(details.stats.major_titles || 0) });
+    }
+    rows.push(
+      { label: 'Matches', value: Number(details.stats?.matches || 0) },
+      { label: 'Wins', value: Number(details.stats?.wins || 0) },
+      { label: 'Win Rate', value: Number(details.stats?.win_rate || 0) }
+    );
+    return rows.slice(0, 4);
+  }
+
   if (type === 'compare_players') {
     return [
       {
@@ -241,6 +298,21 @@ function buildKeyStats(details = {}) {
   if (type === 'top_players') {
     return (Array.isArray(details.rows) ? details.rows : []).slice(0, 3).map((row) => ({
       label: `#${row.rank || ''} ${row.player || 'Player'}`,
+      value: formatStatValue(row.value)
+    }));
+  }
+
+  if (type === 'record_lookup') {
+    if (details.stats && typeof details.stats === 'object' && !Array.isArray(details.stats)) {
+      return Object.entries(details.stats)
+        .slice(0, 4)
+        .map(([label, value]) => ({
+          label: titleCaseMetric(label),
+          value
+        }));
+    }
+    return (Array.isArray(details.rows) ? details.rows : []).slice(0, 3).map((row) => ({
+      label: `#${row.rank || ''} ${row.player || row.team || 'Record'}`,
       value: formatStatValue(row.value)
     }));
   }
@@ -284,6 +356,16 @@ function buildInsights(details = {}, summary = '', answer = '') {
     ]).slice(0, 3);
   }
 
+  if (type === 'team_info' && details.team?.name) {
+    return uniqueNonEmpty([
+      details.team?.captain ? `${details.team.name} are captained by ${details.team.captain}.` : '',
+      Number(details.stats?.ipl_titles || 0) ? `${details.team.name} have ${formatStatValue(details.stats.ipl_titles)} IPL titles in the current team profile.` : '',
+      Number(details.stats?.win_rate || 0) ? `${details.team.name} has an archived win rate of ${formatStatValue(details.stats.win_rate)}%.` : '',
+      Number(details.stats?.matches || 0) ? `${details.team.name} appears in ${formatStatValue(details.stats.matches)} archived matches.` : '',
+      summary
+    ]).slice(0, 3);
+  }
+
   if (type === 'top_players' && Array.isArray(details.rows) && details.rows[0]?.player) {
     return [`${details.rows[0].player} leads this leaderboard in the current query scope.`];
   }
@@ -300,6 +382,200 @@ function buildInsights(details = {}, summary = '', answer = '') {
   const note = extractAnalystNote(answer) || extractAnalystNote(summary);
   if (note) return [note];
   return summary ? [summary] : [];
+}
+
+function toUnifiedResponseType(details = {}) {
+  const rawType = String(details.type || '').trim();
+
+  if (rawType === 'player_stats' || rawType === 'player_season_stats') return 'player';
+  if (rawType === 'team_stats' || rawType === 'team_info') return 'team';
+  if (rawType === 'match_summary' || rawType === 'live_update') return 'match';
+  if (rawType === 'compare_players' || rawType === 'head_to_head') return 'comparison';
+  if (rawType === 'record_lookup') return 'record';
+  if (rawType === 'subjective_analysis') {
+    return details.left || details.right || details.team1 || details.team2 ? 'comparison' : 'record';
+  }
+  return 'record';
+}
+
+function toStatKey(label = '') {
+  return String(label || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '') || 'value';
+}
+
+function normalizeStatEntryValue(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const clean = String(value ?? '').trim();
+  return clean || null;
+}
+
+function buildUnifiedStats(details = {}) {
+  const keyStats = buildKeyStats(details);
+  if (!Array.isArray(keyStats) || !keyStats.length) return {};
+
+  return keyStats.reduce((accumulator, item, index) => {
+    const labelKey = toStatKey(item.label || `stat_${index + 1}`);
+    const value = normalizeStatEntryValue(item.value);
+    const left = normalizeStatEntryValue(item.left);
+    const right = normalizeStatEntryValue(item.right);
+
+    if (left !== null || right !== null) {
+      if (left !== null) accumulator[`${labelKey}_left`] = left;
+      if (right !== null) accumulator[`${labelKey}_right`] = right;
+      return accumulator;
+    }
+
+    if (value !== null) {
+      accumulator[labelKey] = value;
+    }
+
+    return accumulator;
+  }, {});
+}
+
+function pruneEmptyFields(value) {
+  if (Array.isArray(value)) {
+    const next = value
+      .map((item) => pruneEmptyFields(item))
+      .filter((item) => {
+        if (item === null || item === undefined) return false;
+        if (item === '') return false;
+        if (Array.isArray(item)) return item.length > 0;
+        if (typeof item === 'object') return Object.keys(item).length > 0;
+        return true;
+      });
+    return next;
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.entries(value).reduce((accumulator, [key, nestedValue]) => {
+      const cleaned = pruneEmptyFields(nestedValue);
+      if (cleaned === null || cleaned === undefined) return accumulator;
+      if (cleaned === '') return accumulator;
+      if (Array.isArray(cleaned) && !cleaned.length) return accumulator;
+      if (cleaned && typeof cleaned === 'object' && !Array.isArray(cleaned) && !Object.keys(cleaned).length) {
+        return accumulator;
+      }
+      accumulator[key] = cleaned;
+      return accumulator;
+    }, {});
+  }
+
+  return value;
+}
+
+function buildUnifiedImage(details = {}) {
+  if (details.player?.image_url) return String(details.player.image_url || '').trim();
+  if (details.team?.image_url) return String(details.team.image_url || '').trim();
+  if (details.image_url) return String(details.image_url || '').trim();
+  if (details.left?.image_url && !details.right?.image_url) return String(details.left.image_url || '').trim();
+  return '';
+}
+
+function buildUnifiedExtra(details = {}, summary = '', answer = '', suggestions = []) {
+  const insights = buildInsights(details, summary, answer);
+  const rawType = String(details.type || '').trim();
+  const extra = {
+    action: rawType || 'summary',
+    subtitle: String(details.subtitle || '').trim(),
+    suggestions,
+    insights
+  };
+
+  if (rawType === 'chat') {
+    extra.mode = 'chat';
+    extra.message = String(details.message || summary || answer || '').trim();
+    return pruneEmptyFields(extra);
+  }
+
+  if (rawType === 'subjective_analysis') {
+    extra.question = String(details.question || '').trim();
+    return pruneEmptyFields(extra);
+  }
+
+  if (rawType === 'player_stats' || rawType === 'player_season_stats') {
+    extra.entities = {
+      player: details.player || {}
+    };
+    extra.player_description = String(details.player?.description || '').trim();
+    extra.recent_matches = Array.isArray(details.recent_matches) ? details.recent_matches : [];
+    return pruneEmptyFields(extra);
+  }
+
+  if (rawType === 'team_stats') {
+    extra.entities = {
+      team: details.team || {}
+    };
+    extra.recent_matches = Array.isArray(details.recent_matches) ? details.recent_matches : [];
+    return pruneEmptyFields(extra);
+  }
+
+  if (rawType === 'team_info') {
+    extra.entities = {
+      team: details.team || {}
+    };
+    extra.question = String(details.question || '').trim();
+    extra.recent_matches = Array.isArray(details.recent_matches) ? details.recent_matches : [];
+    return pruneEmptyFields(extra);
+  }
+
+  if (rawType === 'compare_players') {
+    extra.entities = {
+      left: details.left || {},
+      right: details.right || {}
+    };
+    return pruneEmptyFields(extra);
+  }
+
+  if (rawType === 'head_to_head') {
+    extra.entities = {
+      team1: details.team1 || '',
+      team2: details.team2 || ''
+    };
+    extra.recent_matches = Array.isArray(details.recent_matches) ? details.recent_matches : [];
+    return pruneEmptyFields(extra);
+  }
+
+  if (rawType === 'match_summary') {
+    extra.match = details.match || {};
+    return pruneEmptyFields(extra);
+  }
+
+  if (rawType === 'live_update') {
+    extra.live_match = details.live_match || {};
+    extra.next_match = details.next_match || {};
+    extra.upcoming_matches = Array.isArray(details.upcoming_matches) ? details.upcoming_matches : [];
+    extra.recent_matches = Array.isArray(details.recent_matches) ? details.recent_matches : [];
+    extra.entities = details.player ? { player: details.player } : {};
+    extra.provider_status = details.provider_status || {};
+    return pruneEmptyFields(extra);
+  }
+
+  if (rawType === 'top_players') {
+    extra.metric = String(details.metric || '').trim();
+    extra.resolved_metric = String(details.resolved_metric || '').trim();
+    extra.rows = Array.isArray(details.rows) ? details.rows : [];
+    return pruneEmptyFields(extra);
+  }
+
+  if (rawType === 'record_lookup') {
+    extra.question = String(details.question || '').trim();
+    extra.metric = String(details.metric || '').trim();
+    extra.resolved_metric = String(details.resolved_metric || '').trim();
+    extra.rows = Array.isArray(details.rows) ? details.rows : [];
+    return pruneEmptyFields(extra);
+  }
+
+  if (rawType === 'glossary') {
+    extra.term = String(details.term || '').trim();
+    extra.explanation = String(details.explanation || '').trim();
+    return pruneEmptyFields(extra);
+  }
+
+  return pruneEmptyFields(extra);
 }
 
 function extractAnalystNote(text = '') {
@@ -400,6 +676,306 @@ function buildEntityCandidates(...values) {
   );
 }
 
+function buildPhraseCandidates(text = '', { minWords = 1, maxWords = 4 } = {}) {
+  const tokens = normalizeText(text).split(' ').filter(Boolean);
+  const phrases = [];
+  for (let size = Math.min(maxWords, tokens.length); size >= 1; size -= 1) {
+    if (size < minWords) continue;
+    for (let index = 0; index <= tokens.length - size; index += 1) {
+      phrases.push(tokens.slice(index, index + size).join(' '));
+    }
+  }
+  return uniqueNonEmpty(phrases);
+}
+
+function stripWikiMarkup(value = '') {
+  let text = String(value || '');
+  if (!text) return '';
+
+  text = text
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<ref[\s\S]*?<\/ref>/gi, ' ')
+    .replace(/<ref[^>]*\/>/gi, ' ')
+    .replace(/&nbsp;/gi, ' ');
+
+  let previous = '';
+  while (text !== previous) {
+    previous = text;
+    text = text.replace(/{{[^{}]*}}/g, ' ');
+  }
+
+  text = text
+    .replace(/\[\[(?:[^|\]]+\|)?([^\]]+)\]\]/g, '$1')
+    .replace(/\[https?:\/\/[^\s\]]+\s*([^\]]*)\]/g, '$1')
+    .replace(/'''|''/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return text;
+}
+
+async function fetchWikipediaSummary(topic = '') {
+  const cleanTopic = String(topic || '').trim();
+  if (!cleanTopic) return null;
+  const cacheKey = cleanTopic.toLowerCase();
+  if (wikipediaSummaryCache.has(cacheKey)) {
+    return wikipediaSummaryCache.get(cacheKey);
+  }
+
+  try {
+    const response = await fetch(
+      `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(cleanTopic.replace(/\s+/g, '_'))}`,
+      {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'Cricket-Intelligence-Console/1.0'
+        }
+      }
+    );
+    if (!response.ok) {
+      wikipediaSummaryCache.set(cacheKey, null);
+      return null;
+    }
+    const payload = await response.json();
+    const summary = {
+      title: String(payload?.title || cleanTopic).trim(),
+      description: String(payload?.description || '').trim(),
+      extract: String(payload?.extract || '').trim(),
+      image: String(payload?.thumbnail?.source || '').trim()
+    };
+    wikipediaSummaryCache.set(cacheKey, summary);
+    return summary;
+  } catch (_) {
+    wikipediaSummaryCache.set(cacheKey, null);
+    return null;
+  }
+}
+
+async function fetchWikipediaWikitext(topic = '') {
+  const cleanTopic = String(topic || '').trim();
+  if (!cleanTopic) return '';
+  const cacheKey = cleanTopic.toLowerCase();
+  if (wikipediaWikitextCache.has(cacheKey)) {
+    return wikipediaWikitextCache.get(cacheKey);
+  }
+
+  try {
+    const response = await fetch(
+      `https://en.wikipedia.org/w/api.php?action=parse&page=${encodeURIComponent(cleanTopic.replace(/\s+/g, '_'))}&prop=wikitext&formatversion=2&format=json`,
+      {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'Cricket-Intelligence-Console/1.0'
+        }
+      }
+    );
+    if (!response.ok) {
+      wikipediaWikitextCache.set(cacheKey, '');
+      return '';
+    }
+    const payload = await response.json();
+    const wikitext = String(payload?.parse?.wikitext || '').trim();
+    wikipediaWikitextCache.set(cacheKey, wikitext);
+    return wikitext;
+  } catch (_) {
+    wikipediaWikitextCache.set(cacheKey, '');
+    return '';
+  }
+}
+
+function parseWikipediaInfoboxFields(wikitext = '') {
+  const source = String(wikitext || '');
+  const infoboxStart = source.indexOf('{{Infobox cricket team');
+  if (infoboxStart < 0) return {};
+
+  const infoboxEnd = source.indexOf('\n}}', infoboxStart);
+  const infoboxBlock = source.slice(
+    infoboxStart,
+    infoboxEnd > infoboxStart ? infoboxEnd : Math.min(source.length, infoboxStart + 4000)
+  );
+  const fields = {};
+
+  for (const line of infoboxBlock.split('\n')) {
+    const match = line.match(/^\|\s*([^=]+?)\s*=\s*(.*)$/);
+    if (!match) continue;
+    const key = normalizeText(match[1]).replace(/\s+/g, '_');
+    const value = stripWikiMarkup(match[2]);
+    if (!key || !value) continue;
+    fields[key] = value;
+  }
+
+  return fields;
+}
+
+function extractCountFromText(value = '') {
+  const clean = stripWikiMarkup(value);
+  const numericMatch = clean.match(/\b(\d+)\b/);
+  if (numericMatch) return Number(numericMatch[1]);
+  const wordMatch = clean.match(/\b(one|two|three|four|five|six|seven|eight|nine|ten)\b/i);
+  return wordToNumber(wordMatch?.[1] || '');
+}
+
+function buildTeamTitleStats(fields = {}) {
+  const titles = [];
+  for (let index = 1; index <= 4; index += 1) {
+    const title = String(fields[`title${index}`] || '').trim();
+    const wins = extractCountFromText(fields[`title${index}wins`]);
+    if (!title || wins === null) continue;
+    titles.push({
+      title,
+      wins
+    });
+  }
+  return titles;
+}
+
+function formatTitleWinLine(entry = {}) {
+  const wins = Number(entry.wins || 0);
+  const title = String(entry.title || '').trim();
+  if (!title || !wins) return '';
+  const titleLabel = title.includes('title') ? title : `${title} title${wins === 1 ? '' : 's'}`;
+  return `${wins} ${titleLabel}`;
+}
+
+function buildTeamInfoAnswerFromWiki(question = '', teamName = '', wiki = null, fields = {}) {
+  const extract = String(wiki?.extract || '').trim();
+  const description = String(wiki?.description || '').trim();
+  const text = `${description}. ${extract}`.trim();
+  const normalizedQuestion = normalizeText(question);
+
+  if (/\btroph(?:y|ies)|titles?\b/.test(normalizedQuestion)) {
+    const titleLines = buildTeamTitleStats(fields).map(formatTitleWinLine).filter(Boolean);
+    if (titleLines.length) {
+      return `${teamName} have won ${titleLines.join(' and ')}.`;
+    }
+    const match =
+      text.match(/(\d+|one|two|three|four|five|six|seven|eight|nine|ten)[-\s]*(?:time\s+)?(?:champions?|titles?|trophies)/i) ||
+      text.match(/won\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:titles?|trophies)/i);
+    const count = wordToNumber(match?.[1] || '');
+    if (count !== null) {
+      return `${teamName} have won ${count} major titles based on the current Wikipedia summary.`;
+    }
+  }
+
+  if (/\bcaptain\b/.test(normalizedQuestion)) {
+    if (fields.captain) {
+      return `${teamName} are captained by ${fields.captain}.`;
+    }
+    const match =
+      text.match(/captained by\s+([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){0,3})/i) ||
+      text.match(/captain(?:ed)?\s+by\s+([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){0,3})/i);
+    if (match?.[1]) {
+      return `${teamName} are captained by ${String(match[1]).trim()} based on the current Wikipedia summary.`;
+    }
+  }
+
+  if (/\bcoach\b/.test(normalizedQuestion) && fields.coach) {
+    return `${teamName} are coached by ${fields.coach}.`;
+  }
+
+  if (/\bowner\b/.test(normalizedQuestion) && fields.owner) {
+    return `${teamName} are owned by ${fields.owner}.`;
+  }
+
+  if (/\b(home ground|stadium|ground|venue)\b/.test(normalizedQuestion) && fields.ground) {
+    return `${teamName} play their home matches at ${fields.ground}.`;
+  }
+
+  if (/\bfounded\b|\bwhen started\b|\bestablished\b/.test(normalizedQuestion) && fields.founded) {
+    return `${teamName} were founded in ${fields.founded}.`;
+  }
+
+  if (!text) return '';
+  return extract || text;
+}
+
+function lookupKnownRecord(question = '') {
+  const normalizedQuestion = normalizeText(question);
+
+  if (
+    (/\bhighest score\b/.test(normalizedQuestion) && /\bodi\b|\bone day international\b/.test(normalizedQuestion)) ||
+    /\bhighest score in odi\b/.test(normalizedQuestion)
+  ) {
+    return {
+      title: 'Highest ODI Score',
+      metric: 'highest_score',
+      resolved_metric: 'exact_record',
+      answer:
+        'Rohit Sharma holds the men\'s ODI highest-score record with 264 against Sri Lanka at Eden Gardens on 13 November 2014.',
+      stats: {
+        player: 'Rohit Sharma',
+        record: 264,
+        opposition: 'Sri Lanka',
+        venue: 'Eden Gardens',
+        date: '2014-11-13'
+      },
+      player_name: 'Rohit Sharma'
+    };
+  }
+
+  if (
+    (/\bfastest century\b|\bfastest 100\b/.test(normalizedQuestion) &&
+      /\bt20\b|\bt20i\b|\btwenty20\b/.test(normalizedQuestion))
+  ) {
+    return {
+      title: 'Fastest T20I Century',
+      metric: 'fastest_century',
+      resolved_metric: 'exact_record',
+      answer:
+        'Sahil Chauhan holds the men\'s T20I fastest-century record with a hundred in 27 balls against Cyprus on 17 June 2024.',
+      stats: {
+        player: 'Sahil Chauhan',
+        balls: 27,
+        opposition: 'Cyprus',
+        date: '2024-06-17'
+      },
+      player_name: 'Sahil Chauhan'
+    };
+  }
+
+  if (
+    /\bmost wickets\b/.test(normalizedQuestion) &&
+    /\b(world cup|wc)\b/.test(normalizedQuestion)
+  ) {
+    return {
+      title: 'Most World Cup Wickets',
+      metric: 'most_wickets_world_cup',
+      resolved_metric: 'exact_record',
+      answer:
+        'Glenn McGrath holds the men\'s Cricket World Cup wickets record with 71 wickets.',
+      stats: {
+        player: 'Glenn McGrath',
+        wickets: 71,
+        tournament: 'Cricket World Cup'
+      },
+      player_name: 'Glenn McGrath'
+    };
+  }
+
+  if (
+    /\blowest total\b/.test(normalizedQuestion) &&
+    /\btest\b/.test(normalizedQuestion)
+  ) {
+    return {
+      title: 'Lowest Test Total',
+      metric: 'lowest_total',
+      resolved_metric: 'exact_record',
+      answer:
+        'New Zealand hold the men\'s Test lowest-total record after being bowled out for 26 against England in Auckland in 1955.',
+      stats: {
+        team: 'New Zealand',
+        total: 26,
+        opposition: 'England',
+        venue: 'Auckland',
+        year: 1955
+      }
+    };
+  }
+
+  return null;
+}
+
 function resolutionWeight(status = '') {
   if (status === 'resolved') return 3;
   if (status === 'clarify') return 2;
@@ -407,19 +983,24 @@ function resolutionWeight(status = '') {
   return 0;
 }
 
-function resolveEntityWithFallback(entityType, candidates = []) {
+async function resolveEntityWithFallback(entityType, candidates = []) {
   const queries = buildEntityCandidates(...candidates);
   let best = {
     query: queries[0] || '',
-    resolution: { status: 'missing' }
+    resolution: { status: 'missing', score: 0 }
   };
 
   for (const query of queries) {
-    const resolution = resolveEntityStrict(entityType, query);
+    const resolution = await resolveEntityStrict(entityType, query);
     if (resolution.status === 'resolved') {
-      return { query, resolution };
+      const currentScore = Number(resolution.score || 0);
+      const bestScore = Number(best.resolution?.score || 0);
+      if (best.resolution.status !== 'resolved' || currentScore > bestScore) {
+        best = { query, resolution };
+      }
+      continue;
     }
-    if (resolutionWeight(resolution.status) > resolutionWeight(best.resolution.status)) {
+    if (best.resolution.status !== 'resolved' && resolutionWeight(resolution.status) > resolutionWeight(best.resolution.status)) {
       best = { query, resolution };
     }
   }
@@ -442,23 +1023,165 @@ function buildResponse(result = {}) {
         ? result.followups
         : []
   ).slice(0, 3);
-  const type = String(details.type || 'analysis').trim() || 'analysis';
+  const type = toUnifiedResponseType(details);
   const title = String(details.title || 'Cricket Intelligence').trim() || 'Cricket Intelligence';
-  const summary = deriveSummaryText(answer, details);
-  const keyStats = buildKeyStats(details);
-  const insights = buildInsights(details, summary, answer);
+  const summarySource = String(details.summary || answer || NOT_AVAILABLE_MESSAGE).trim() || NOT_AVAILABLE_MESSAGE;
+  const summary = summarySource.length > 1200 ? `${summarySource.slice(0, 1197).trim()}...` : summarySource;
+  const image = buildUnifiedImage(details);
+  const stats = buildUnifiedStats(details);
+  const extra = buildUnifiedExtra(details, summary, answer, suggestions);
   return {
     type,
     title,
-    answer,
+    image,
     summary,
-    key_stats: keyStats,
-    insights,
-    details,
-    suggestions,
-    data: details,
-    followups: suggestions
+    stats,
+    extra
   };
+}
+
+function applySessionContext(question = '', session = null) {
+  const text = String(question || '').trim();
+  const playerName = String(session?.context?.player_name || '').trim();
+  const teamName = String(session?.context?.team_name || '').trim();
+  let rewritten = text;
+  let usedContext = false;
+
+  if (!text) return text;
+  if (PLAYER_CONTEXT_PRONOUN_REGEX.test(text) && playerName) {
+    rewritten = rewritten
+      .replace(/\bhis\b/gi, `${playerName}'s`)
+      .replace(/\bhe\b/gi, playerName)
+      .replace(/\bhim\b/gi, playerName)
+      .replace(/\bshe\b/gi, playerName)
+      .replace(/\bher\b/gi, `${playerName}'s`);
+    usedContext = true;
+  }
+  if (TEAM_CONTEXT_PRONOUN_REGEX.test(text) && teamName) {
+    rewritten = rewritten
+      .replace(/\btheir\b/gi, `${teamName}'s`)
+      .replace(/\bthey\b/gi, teamName)
+      .replace(/\bthem\b/gi, teamName);
+    usedContext = true;
+  }
+  if (!usedContext) return text;
+
+  return [
+    rewritten,
+    '',
+    `Resolved conversation context: player=${playerName || 'n/a'}; team=${teamName || 'n/a'}.`
+  ].join('\n');
+}
+
+function buildSessionContextPatch(route = {}, publicDetails = {}) {
+  const patch = {};
+  const type = String(publicDetails?.type || '').trim();
+
+  if (route?.season) patch.season = String(route.season);
+  if (route?.format) patch.format = String(route.format);
+  if (route?.action) patch.action = String(route.action);
+
+  if (type === 'player_stats' && publicDetails.player?.name) {
+    patch.player_name = String(publicDetails.player.name || '').trim();
+    if (publicDetails.player.id) {
+      patch.player_id = String(publicDetails.player.id || '').trim();
+    }
+    if (publicDetails.player.team) {
+      patch.team_name = String(publicDetails.player.team || '').trim();
+    }
+    return patch;
+  }
+
+  if (type === 'team_stats' && publicDetails.team?.name) {
+    patch.team_name = String(publicDetails.team.name || '').trim();
+    if (publicDetails.team.id) {
+      patch.team_id = String(publicDetails.team.id || '').trim();
+    }
+    return patch;
+  }
+
+  if (type === 'live_update') {
+    if (publicDetails.player?.name) {
+      patch.player_name = String(publicDetails.player.name || '').trim();
+      if (publicDetails.player.id) {
+        patch.player_id = String(publicDetails.player.id || '').trim();
+      }
+    }
+    if (route?.team) {
+      patch.team_name = String(route.team || '').trim();
+    }
+    return patch;
+  }
+
+  if (route?.action === 'player_stats' || route?.action === 'player_season_stats') {
+    if (route.player) {
+      patch.player_name = String(route.player || '').trim();
+    }
+  }
+
+  if (route?.action === 'team_stats' && route.team) {
+    patch.team_name = String(route.team || '').trim();
+  }
+
+  return patch;
+}
+
+function syncSessionState(session, route = {}, structuredContext = {}, publicDetails = {}) {
+  if (!session) return;
+
+  const resultData =
+    structuredContext?.result?.data && typeof structuredContext.result.data === 'object'
+      ? structuredContext.result.data
+      : {};
+
+  if (String(resultData.type || '').trim() === 'name_resolution') {
+    setPendingClarification(session, {
+      entity: String(resultData.entity || '').trim(),
+      query: String(resultData.query || '').trim(),
+      choices: Array.isArray(resultData.choices) ? resultData.choices.slice(0, 5) : []
+    });
+    return;
+  }
+
+  clearPendingClarification(session);
+  const patch = buildSessionContextPatch(route, publicDetails);
+  if (Object.keys(patch).length) {
+    updateContext(session, patch);
+  }
+}
+
+function applySessionRouteFallback(route = {}, question = '', session = null) {
+  const normalizedQuestion = normalizeText(question);
+  const playerName = String(session?.context?.player_name || '').trim();
+  const teamName = String(session?.context?.team_name || '').trim();
+  const playerPronoun = PLAYER_CONTEXT_PRONOUN_REGEX.test(question);
+  const teamPronoun = TEAM_CONTEXT_PRONOUN_REGEX.test(question);
+  const action = String(route?.action || '').trim();
+  const isStatsLikeQuestion = FACT_LOOKUP_REGEX.test(normalizedQuestion);
+
+  if (playerPronoun && playerName && isStatsLikeQuestion && ['glossary', 'not_supported', ''].includes(action)) {
+    return {
+      ...route,
+      action: 'player_stats',
+      player: playerName,
+      team: '',
+      term: '',
+      query: playerName
+    };
+  }
+
+  if (teamPronoun && teamName && isStatsLikeQuestion && ['glossary', 'not_supported', ''].includes(action)) {
+    return {
+      ...route,
+      action: 'team_stats',
+      team: teamName,
+      player: '',
+      term: '',
+      query: teamName
+    };
+  }
+
+  return route;
 }
 
 function emitStatus(onStatus, payload) {
@@ -467,13 +1190,17 @@ function emitStatus(onStatus, payload) {
 }
 
 function actionStatusMessage(action = '') {
+  if (action === 'chit_chat') return 'Responding...';
+  if (action === 'subjective_analysis') return 'Analyzing the debate.';
   if (action === 'player_stats' || action === 'player_season_stats') {
     return 'Searching player stats.';
   }
   if (action === 'team_stats') return 'Searching team stats.';
+  if (action === 'team_info') return 'Checking team information.';
   if (action === 'match_summary') return 'Searching match details.';
   if (action === 'compare_players') return 'Comparing players.';
   if (action === 'head_to_head') return 'Checking head-to-head results.';
+  if (action === 'record_lookup') return 'Checking cricket records.';
   if (action === 'top_players') return 'Searching top performers.';
   if (action === 'glossary') return 'Preparing a short explanation.';
   return 'Searching cricket stats.';
@@ -549,12 +1276,154 @@ function unresolvedEntityResult(entityType, query, resolution = {}) {
   };
 }
 
-function resolveEntityStrict(entityType, query = '') {
-  return entityType === 'team' ? resolveTeam(query) : resolvePlayer(query);
+function normalizeResolvedEntity(entityType, item = {}) {
+  if (!item || typeof item !== 'object') return item;
+  if (entityType === 'player') {
+    const canonicalName = String(item.canonical_name || item.name || '').trim() || String(item.name || '').trim();
+    return {
+      ...item,
+      dataset_name: String(item.name || '').trim(),
+      canonical_name: canonicalName,
+      name: canonicalName
+    };
+  }
+  return item;
 }
 
-function runPlayerAction(action, route, question) {
-  const { query: playerQuery, resolution } = resolveEntityWithFallback('player', [
+function buildResolutionChoices(entityType, matches = []) {
+  return uniqueNonEmpty(
+    matches.slice(0, 5).map((item) => {
+      if (entityType === 'player') {
+        return String(item.canonical_name || item.name || '').trim();
+      }
+      return String(item.name || '').trim();
+    })
+  );
+}
+
+async function resolveEntityStrict(entityType, query = '') {
+  const cleanQuery = String(query || '').trim();
+  if (!cleanQuery) return { status: 'missing' };
+
+  const rawResolution =
+    entityType === 'team'
+      ? await resolveVectorTeam(cleanQuery)
+      : await resolveVectorPlayer(cleanQuery);
+
+  const matches = Array.isArray(rawResolution?.matches) ? rawResolution.matches : [];
+  if (rawResolution?.item) {
+    return {
+      status: 'resolved',
+      item: normalizeResolvedEntity(entityType, rawResolution.item),
+      choices: buildResolutionChoices(entityType, matches),
+      score: Number(rawResolution?.score || matches[0]?.score || 0)
+    };
+  }
+  if (matches.length) {
+    return {
+      status: 'resolved',
+      item: normalizeResolvedEntity(entityType, matches[0]),
+      choices: buildResolutionChoices(entityType, matches),
+      score: Number(matches[0]?.score || 0)
+    };
+  }
+
+  return {
+    status: 'not_found',
+    query: cleanQuery,
+    choices: []
+  };
+}
+
+function toPlayerStats(player = {}) {
+  return {
+    matches: Number(player.matches || 0),
+    runs: Number(player.runs || 0),
+    average: Number(player.average || 0),
+    strike_rate: Number(player.strike_rate || 0),
+    wickets: Number(player.wickets || 0),
+    economy: Number(player.economy || 0),
+    fours: Number(player.fours || 0),
+    sixes: Number(player.sixes || 0)
+  };
+}
+
+function toTeamStats(team = {}) {
+  const matches = Number(team.matches || 0);
+  const runs = Number(team.runs || 0);
+  return {
+    matches,
+    wins: Number(team.wins || 0),
+    losses: Number(team.losses || 0),
+    no_result: Number(team.no_result || 0),
+    win_rate: Number(team.win_rate || 0),
+    average_score: matches > 0 ? Number((runs / matches).toFixed(2)) : 0,
+    runs
+  };
+}
+
+function toPublicMatch(match = {}) {
+  const team1 = String(match.team1 || '').trim();
+  const team2 = String(match.team2 || '').trim();
+  const inningsSummary = String(match.innings_summary || '').trim();
+  const winner = String(match.winner || '').trim();
+  return {
+    id: String(match.id || '').trim(),
+    name: team1 && team2 ? `${team1} vs ${team2}` : 'Match Summary',
+    teams: [team1, team2].filter(Boolean),
+    date: String(match.date || '').trim(),
+    venue: String(match.venue || '').trim(),
+    status: winner ? `${winner} won` : 'Result unavailable',
+    winner,
+    match_type: String(match.format || '').trim(),
+    summary: uniqueNonEmpty([
+      winner ? `${winner} won.` : '',
+      inningsSummary
+    ]).join(' '),
+    top_batters: [],
+    top_bowlers: [],
+    score: []
+  };
+}
+
+function compareMetricLine(label = '', leftName = '', leftValue = 0, rightName = '', rightValue = 0) {
+  if (leftValue === rightValue) {
+    return `${label}: ${leftName} and ${rightName} are level at ${formatStatValue(leftValue)}.`;
+  }
+  const leader = leftValue > rightValue ? leftName : rightName;
+  const trailingValue = leftValue > rightValue ? rightValue : leftValue;
+  const winningValue = Math.max(leftValue, rightValue);
+  return `${label}: ${leader} leads ${formatStatValue(winningValue)} to ${formatStatValue(trailingValue)}.`;
+}
+
+function resolveLeaderboardMetric(routeMetric = '', question = '') {
+  const explicit = String(routeMetric || '').trim();
+  const normalizedQuestion = normalizeText(question);
+  if (explicit === 'sixes') {
+    return { requested_metric: 'sixes', resolved_metric: 'sixes', note: '' };
+  }
+  if (explicit === 'fours') {
+    return { requested_metric: 'fours', resolved_metric: 'fours', note: '' };
+  }
+  if (/\bfastest\s+(?:50|fifty|100|century)\b|\bquickest\s+(?:50|fifty|100|century)\b|\bmost aggressive batting\b/.test(normalizedQuestion)) {
+    return {
+      requested_metric: explicit || 'fastest_50',
+      resolved_metric: 'strike_rate',
+      note: 'Using strike rate as the nearest archived proxy for fastest scoring.'
+    };
+  }
+  if (/\bmost six(?:es)?\b|\bbig hitters?\b|\bpower hitters?\b/.test(normalizedQuestion)) {
+    return { requested_metric: 'sixes', resolved_metric: 'sixes', note: '' };
+  }
+  if (/\bmost four(?:s)?\b/.test(normalizedQuestion)) {
+    return { requested_metric: 'fours', resolved_metric: 'fours', note: '' };
+  }
+  const metric = explicit || guessMetric(question);
+  return { requested_metric: metric, resolved_metric: metric, note: '' };
+}
+
+async function runPlayerAction(action, route, question) {
+  const { query: playerQuery, resolution } = await resolveEntityWithFallback('player', [
     route.player,
     removeGenericWords(question),
     question
@@ -563,17 +1432,42 @@ function runPlayerAction(action, route, question) {
     return unresolvedEntityResult('player', playerQuery, resolution);
   }
   const player = resolution.item;
+  const stats = toPlayerStats(player);
+  const season = toSeason(pickFirst(route.season, guessSeason(question)));
+  const format = pickFirst(route.format, guessFormat(question));
+  const scopeNote = season
+    ? `Season-specific splits are not indexed in the current vector archive, so this is the latest verified overall profile for ${player.name}.`
+    : '';
 
-  const filters = {
-    season: toSeason(pickFirst(route.season, guessSeason(question))),
-    format: pickFirst(route.format, guessFormat(question))
+  return {
+    answer: uniqueNonEmpty([
+      `${player.name} has ${formatStatValue(stats.runs)} runs from ${formatStatValue(stats.matches)} archived matches, with an average of ${formatStatValue(stats.average)} and strike rate ${formatStatValue(stats.strike_rate)}.`,
+      stats.wickets ? `${player.name} has also taken ${formatStatValue(stats.wickets)} wickets.` : '',
+      scopeNote
+    ]).join(' '),
+    data: {
+      type: 'player_stats',
+      title: player.name,
+      subtitle: [player.team, format, season].filter(Boolean).join(' | '),
+      player: {
+        id: player.id,
+        name: player.name,
+        canonical_name: player.canonical_name || player.name,
+        dataset_name: player.dataset_name || player.name,
+        team: player.team,
+        role: player.role
+      },
+      stats,
+      recent_matches: []
+    },
+    followups: ['Compare two players', 'Show recent live scores', 'Show team head to head']
   };
-  return executeAction(action, { playerId: player.id, filters });
 }
 
-function runTeamStats(route, question) {
-  const { query: teamQuery, resolution } = resolveEntityWithFallback('team', [
+async function runTeamStats(route, question) {
+  const { query: teamQuery, resolution } = await resolveEntityWithFallback('team', [
     route.team,
+    ...buildPhraseCandidates(question),
     removeGenericWords(question),
     question
   ]);
@@ -581,140 +1475,394 @@ function runTeamStats(route, question) {
     return unresolvedEntityResult('team', teamQuery, resolution);
   }
   const team = resolution.item;
+  const season = toSeason(pickFirst(route.season, guessSeason(question)));
+  const format = pickFirst(route.format, guessFormat(question));
+  const recentMatches = (await findMatchesForTeam(team.name, { limit: 5, year: season, format })).map(toPublicMatch);
+  const stats = toTeamStats(team);
 
-  const filters = {
-    season: toSeason(pickFirst(route.season, guessSeason(question))),
-    format: pickFirst(route.format, guessFormat(question))
+  return {
+    answer: `${team.name} has ${formatStatValue(stats.wins)} wins from ${formatStatValue(stats.matches)} archived matches, a win rate of ${formatStatValue(stats.win_rate)}%, and an average team score of ${formatStatValue(stats.average_score)}.`,
+    data: {
+      type: 'team_stats',
+      title: team.name,
+      subtitle: [format, season].filter(Boolean).join(' | '),
+      team: {
+        id: team.id,
+        name: team.name
+      },
+      stats: {
+        ...stats,
+        recent_matches: recentMatches
+      }
+    },
+    followups: ['Show team head to head', 'Show recent live scores', 'Show upcoming matches']
   };
-  return executeAction('team_stats', { teamId: team.id, filters });
 }
 
-function runMatchSummary(route, question) {
+async function runMatchSummary(route, question) {
+  const season = toSeason(pickFirst(route.season, guessSeason(question)));
+  const format = pickFirst(route.format, guessFormat(question));
   const matchId = pickFirst(route.match_id, guessMatchId(question));
-  if (matchId) return executeAction('match_summary', { matchId });
+  if (matchId) {
+    const directMatch = await getVectorMatchById(matchId);
+    if (!directMatch) return unavailableResult('I could not find that archived match.');
+    const publicMatch = toPublicMatch(directMatch);
+    return {
+      answer: publicMatch.summary || `${publicMatch.name} is available in the archive.`,
+      data: {
+        type: 'match_summary',
+        match: publicMatch
+      },
+      followups: ['Show team head to head', 'Show live scores', 'Show upcoming matches']
+    };
+  }
 
   const vs = parseVsSides(question) || {};
-  const leftLookup = resolveEntityWithFallback('team', [route.team1, vs.left]);
-  const rightLookup = resolveEntityWithFallback('team', [route.team2, vs.right]);
-  const leftQuery = leftLookup.query;
-  const rightQuery = rightLookup.query;
-  const leftResolution = leftQuery ? leftLookup.resolution : null;
-  const rightResolution = rightQuery ? rightLookup.resolution : null;
+  const leftLookup = vs.left
+    ? await resolveEntityWithFallback('team', [route.team1, vs.left])
+    : { query: '', resolution: null };
+  const rightLookup = vs.right
+    ? await resolveEntityWithFallback('team', [route.team2, vs.right])
+    : { query: '', resolution: null };
 
-  if (leftResolution && leftResolution.status !== 'resolved') {
-    return unresolvedEntityResult('team', leftQuery, leftResolution);
+  if (leftLookup.resolution && leftLookup.resolution.status !== 'resolved') {
+    return unresolvedEntityResult('team', leftLookup.query, leftLookup.resolution);
   }
-  if (rightResolution && rightResolution.status !== 'resolved') {
-    return unresolvedEntityResult('team', rightQuery, rightResolution);
+  if (rightLookup.resolution && rightLookup.resolution.status !== 'resolved') {
+    return unresolvedEntityResult('team', rightLookup.query, rightLookup.resolution);
   }
 
-  const left = leftResolution?.item || null;
-  const right = rightResolution?.item || null;
-  if (!left && !right) return unavailableResult();
-
-  return executeAction('match_summary', {
-    team1: left?.name || '',
-    team2: right?.name || '',
-    season: toSeason(pickFirst(route.season, guessSeason(question))),
-    date: pickFirst(route.date)
-  });
-}
-
-function runComparePlayers(route, question) {
-  const vs = parseVsSides(question) || {};
-  const leftLookup = resolveEntityWithFallback('player', [route.player1, vs.left]);
-  const rightLookup = resolveEntityWithFallback('player', [route.player2, vs.right]);
-  const leftQuery = leftLookup.query;
-  const rightQuery = rightLookup.query;
-  const leftResolution = leftLookup.resolution;
-  if (leftResolution.status !== 'resolved') {
-    return unresolvedEntityResult('player', leftQuery, leftResolution);
-  }
-  const rightResolution = rightLookup.resolution;
-  if (rightResolution.status !== 'resolved') {
-    return unresolvedEntityResult('player', rightQuery, rightResolution);
-  }
-  const left = leftResolution.item;
-  const right = rightResolution.item;
-
-  const filters = {
-    season: toSeason(pickFirst(route.season, guessSeason(question))),
-    format: pickFirst(route.format, guessFormat(question))
-  };
-  return executeAction('compare_players', {
-    playerId1: left.id,
-    playerId2: right.id,
-    filters
-  });
-}
-
-function runHeadToHead(route, question) {
-  const vs = parseVsSides(question) || {};
-  const leftLookup = resolveEntityWithFallback('team', [route.team1, vs.left]);
-  const rightLookup = resolveEntityWithFallback('team', [route.team2, vs.right]);
-  const leftQuery = leftLookup.query;
-  const rightQuery = rightLookup.query;
-  const leftResolution = leftLookup.resolution;
-  if (leftResolution.status !== 'resolved') {
-    return unresolvedEntityResult('team', leftQuery, leftResolution);
-  }
-  const rightResolution = rightLookup.resolution;
-  if (rightResolution.status !== 'resolved') {
-    return unresolvedEntityResult('team', rightQuery, rightResolution);
-  }
-  const left = leftResolution.item;
-  const right = rightResolution.item;
-
-  const filters = {
-    season: toSeason(pickFirst(route.season, guessSeason(question))),
-    format: pickFirst(route.format, guessFormat(question))
-  };
-  return executeAction('head_to_head', {
-    team1Name: left.name,
-    team2Name: right.name,
-    filters
-  });
-}
-
-function runTopPlayers(route, question) {
-  return executeAction('top_players', {
-    entities: {
-      metric: pickFirst(route.metric, guessMetric(question)),
-      season: toSeason(pickFirst(route.season, guessSeason(question))),
-      format: pickFirst(route.format, guessFormat(question)),
-      limit: Number(route.limit || 10),
-      min_balls: Number(route.min_balls || 200),
-      min_overs: Number(route.min_overs || 20)
+  let match = null;
+  if (leftLookup.resolution?.item && rightLookup.resolution?.item) {
+    match = (await findMatchesByTeams(
+      [leftLookup.resolution.item.name, rightLookup.resolution.item.name],
+      { limit: 1, year: season, format }
+    ))[0] || null;
+  } else {
+    const teamHint = pickFirst(route.team, leftLookup.resolution?.item?.name, rightLookup.resolution?.item?.name);
+    if (teamHint) {
+      match = (await findMatchesForTeam(teamHint, { limit: 1, year: season, format }))[0] || null;
     }
-  });
+  }
+
+  if (!match) {
+    return unavailableResult('I could not find a matching archived match summary.');
+  }
+
+  const publicMatch = toPublicMatch(match);
+  return {
+    answer: publicMatch.summary || `${publicMatch.name} is available in the archive.`,
+    data: {
+      type: 'match_summary',
+      match: publicMatch
+    },
+    followups: ['Show team head to head', 'Show live scores', 'Show upcoming matches']
+  };
 }
 
-function runGlossary(route, question) {
-  return executeAction('glossary', {
-    term: pickFirst(route.term, question)
+async function runComparePlayers(route, question) {
+  const vs = parseVsSides(question) || {};
+  const leftLookup = await resolveEntityWithFallback('player', [route.player1, vs.left]);
+  const rightLookup = await resolveEntityWithFallback('player', [route.player2, vs.right]);
+  if (leftLookup.resolution.status !== 'resolved') {
+    return unresolvedEntityResult('player', leftLookup.query, leftLookup.resolution);
+  }
+  if (rightLookup.resolution.status !== 'resolved') {
+    return unresolvedEntityResult('player', rightLookup.query, rightLookup.resolution);
+  }
+
+  const left = leftLookup.resolution.item;
+  const right = rightLookup.resolution.item;
+  const leftStats = toPlayerStats(left);
+  const rightStats = toPlayerStats(right);
+
+  return {
+    answer: [
+      `${left.name} vs ${right.name}.`,
+      compareMetricLine('Runs', left.name, leftStats.runs, right.name, rightStats.runs),
+      compareMetricLine('Average', left.name, leftStats.average, right.name, rightStats.average),
+      compareMetricLine('Strike Rate', left.name, leftStats.strike_rate, right.name, rightStats.strike_rate),
+      compareMetricLine('Wickets', left.name, leftStats.wickets, right.name, rightStats.wickets)
+    ].join(' '),
+    data: {
+      type: 'compare_players',
+      left: {
+        id: left.id,
+        name: left.name,
+        canonical_name: left.canonical_name || left.name,
+        team: left.team,
+        role: left.role,
+        stats: leftStats
+      },
+      right: {
+        id: right.id,
+        name: right.name,
+        canonical_name: right.canonical_name || right.name,
+        team: right.team,
+        role: right.role,
+        stats: rightStats
+      }
+    },
+    followups: ['Show recent live scores', 'Show team head to head', 'Show top batters']
+  };
+}
+
+async function runHeadToHead(route, question) {
+  const vs = parseVsSides(question) || {};
+  const leftLookup = await resolveEntityWithFallback('team', [route.team1, vs.left]);
+  const rightLookup = await resolveEntityWithFallback('team', [route.team2, vs.right]);
+  if (leftLookup.resolution.status !== 'resolved') {
+    return unresolvedEntityResult('team', leftLookup.query, leftLookup.resolution);
+  }
+  if (rightLookup.resolution.status !== 'resolved') {
+    return unresolvedEntityResult('team', rightLookup.query, rightLookup.resolution);
+  }
+
+  const left = leftLookup.resolution.item;
+  const right = rightLookup.resolution.item;
+  const season = toSeason(pickFirst(route.season, guessSeason(question)));
+  const format = pickFirst(route.format, guessFormat(question));
+  const matches = await findMatchesByTeams([left.name, right.name], { limit: 5000, year: season, format });
+
+  const stats = matches.reduce(
+    (accumulator, match) => {
+      accumulator.matches += 1;
+      if (!match.winner) {
+        accumulator.no_result += 1;
+      } else if (normalizeText(match.winner) === normalizeText(left.name)) {
+        accumulator.wins_team_a += 1;
+      } else if (normalizeText(match.winner) === normalizeText(right.name)) {
+        accumulator.wins_team_b += 1;
+      } else {
+        accumulator.no_result += 1;
+      }
+      return accumulator;
+    },
+    {
+      matches: 0,
+      wins_team_a: 0,
+      wins_team_b: 0,
+      no_result: 0
+    }
+  );
+
+  return {
+    answer:
+      stats.matches > 0
+        ? `${left.name} and ${right.name} have ${formatStatValue(stats.matches)} archived meetings. ${left.name} won ${formatStatValue(stats.wins_team_a)}, ${right.name} won ${formatStatValue(stats.wins_team_b)}, and ${formatStatValue(stats.no_result)} ended without a result.`
+        : `I could not find an archived head-to-head record for ${left.name} vs ${right.name} in the current filter scope.`,
+    data: {
+      type: 'head_to_head',
+      team1: left.name,
+      team2: right.name,
+      stats: {
+        ...stats,
+        recent_matches: matches.slice(0, 5).map(toPublicMatch)
+      }
+    },
+    followups: ['Show live scores', 'Show upcoming matches', 'Compare two players']
+  };
+}
+
+async function runTopPlayers(route, question) {
+  const metricInfo = resolveLeaderboardMetric(pickFirst(route.metric), question);
+  const requestedLimit = Number(route.limit || 10);
+  const allRows = await getTopPlayersByMetric(metricInfo.resolved_metric, {
+    limit: Math.max(50, requestedLimit * 10)
   });
+  let rows = [...allRows];
+  if (metricInfo.resolved_metric === 'strike_rate') {
+    rows = rows.filter((row) => Number(row.matches || 0) >= 20 && Number(row.runs || 0) >= 500);
+  } else if (metricInfo.resolved_metric === 'economy') {
+    rows = rows.filter((row) => Number(row.matches || 0) >= 20 && Number(row.wickets || 0) >= 25);
+  } else if (metricInfo.resolved_metric === 'sixes' || metricInfo.resolved_metric === 'fours') {
+    rows = rows.filter((row) => Number(row.matches || 0) >= 20 && Number(row.runs || 0) >= 1000);
+  }
+  if (!rows.length) {
+    rows = allRows;
+  }
+  rows = rows.slice(0, Math.max(1, requestedLimit)).map((row, index) => ({
+    ...row,
+    rank: index + 1
+  }));
+  const answerRows = rows.slice(0, 3).map((row) => `#${row.rank} ${row.player} - ${formatStatValue(row.value)}`);
+  return {
+    answer: uniqueNonEmpty([
+      answerRows.length
+        ? `Top ${titleCaseMetric(metricInfo.requested_metric)} from the archived vector index: ${answerRows.join('; ')}.`
+        : '',
+      metricInfo.note
+    ]).join(' '),
+    data: {
+      type: 'top_players',
+      metric: metricInfo.requested_metric,
+      resolved_metric: metricInfo.resolved_metric,
+      rows
+    },
+    followups: ['Compare two players', 'Show player stats', 'Show live scores']
+  };
+}
+
+async function runGlossary(route, question) {
+  const rawTerm = pickFirst(route.term, question);
+  const normalizedTerm = normalizeText(rawTerm);
+  const glossaryEntry = Object.entries(GLOSSARY).find(([key]) => {
+    const cleanKey = normalizeText(key.replace(/_/g, ' '));
+    return normalizedTerm.includes(cleanKey);
+  });
+  const term = glossaryEntry?.[0] || rawTerm;
+  const explanation = glossaryEntry?.[1] || 'I can explain common cricket terms like strike rate, economy, average, and head to head.';
+
+  return {
+    answer: explanation,
+    data: {
+      type: 'glossary',
+      term,
+      explanation
+    },
+    followups: ['Show top batters', 'Show player stats', 'Show live scores']
+  };
+}
+
+async function runTeamInfo(route, question) {
+  const vs = parseVsSides(question) || {};
+  const multiWordPhrases = buildPhraseCandidates(question, { minWords: 2, maxWords: 4 });
+  const { query: teamQuery, resolution } = await resolveEntityWithFallback('team', [
+    route.team,
+    route.team1,
+    route.team2,
+    vs.left,
+    vs.right,
+    ...multiWordPhrases,
+    removeGenericWords(question)
+  ]);
+  if (resolution.status !== 'resolved') {
+    return unresolvedEntityResult('team', teamQuery, resolution);
+  }
+
+  const team = resolution.item;
+  const recentMatches = (await findMatchesForTeam(team.name, { limit: 5 })).map(toPublicMatch);
+  const stats = toTeamStats(team);
+  const [wikiSummary, wikiWikitext] = await Promise.all([
+    fetchWikipediaSummary(team.name),
+    fetchWikipediaWikitext(team.name)
+  ]);
+  const wikiFields = parseWikipediaInfoboxFields(wikiWikitext);
+  const titleStats = buildTeamTitleStats(wikiFields);
+  const titleTotal = titleStats.reduce((sum, entry) => sum + Number(entry.wins || 0), 0);
+  const iplTitles = titleStats.find((entry) => /\bipl\b|indian premier league/i.test(entry.title));
+  const answer =
+    buildTeamInfoAnswerFromWiki(question, team.name, wikiSummary, wikiFields) ||
+    `${team.name} have ${formatStatValue(stats.wins)} wins from ${formatStatValue(stats.matches)} archived matches and a win rate of ${formatStatValue(stats.win_rate)}%.`;
+
+  return {
+    answer,
+    data: {
+      type: 'team_info',
+      title: team.name,
+      question: String(question || '').trim(),
+      team: {
+        id: team.id,
+        name: team.name,
+        image_url: String(wikiSummary?.image || '').trim(),
+        description: String(wikiSummary?.description || '').trim(),
+        captain: String(wikiFields.captain || '').trim(),
+        coach: String(wikiFields.coach || '').trim(),
+        owner: String(wikiFields.owner || '').trim(),
+        home_ground: String(wikiFields.ground || '').trim(),
+        founded: String(wikiFields.founded || '').trim()
+      },
+      stats: {
+        ...stats,
+        major_titles: titleTotal || 0,
+        ipl_titles: Number(iplTitles?.wins || 0) || 0
+      },
+      recent_matches: recentMatches
+    },
+    followups: ['Show team head to head', 'Show recent live scores', 'Show upcoming matches']
+  };
+}
+
+async function runRecordLookup(route, question) {
+  const knownRecord = lookupKnownRecord(question);
+  if (knownRecord) {
+    let imageUrl = '';
+    if (knownRecord.player_name) {
+      const profile = await getPlayerProfile({
+        query: knownRecord.player_name,
+        datasetName: knownRecord.player_name
+      });
+      imageUrl = String(profile?.image_url || '').trim();
+    }
+
+    return {
+      answer: knownRecord.answer,
+      data: {
+        type: 'record_lookup',
+        title: knownRecord.title,
+        question: String(question || '').trim(),
+        metric: knownRecord.metric,
+        resolved_metric: knownRecord.resolved_metric,
+        image_url: imageUrl,
+        stats: knownRecord.stats || {},
+        rows: []
+      },
+      followups: ['Show player stats', 'Compare two players', 'Show live scores']
+    };
+  }
+
+  const metricInfo = resolveLeaderboardMetric(pickFirst(route.metric), question);
+  let rows = [];
+  if (['runs', 'wickets', 'strike_rate', 'economy', 'sixes', 'fours'].includes(metricInfo.resolved_metric)) {
+    rows = await getTopPlayersByMetric(metricInfo.resolved_metric, { limit: 10 });
+  }
+
+  return {
+    answer: '',
+    data: {
+      type: 'record_lookup',
+      title: 'Cricket Record',
+      question: String(question || '').trim(),
+      metric: metricInfo.requested_metric,
+      resolved_metric: metricInfo.resolved_metric,
+      rows
+    },
+    followups: ['Show player stats', 'Compare two players', 'Show live scores']
+  };
 }
 
 function isResolved(resolution = {}) {
   return String(resolution.status || '') === 'resolved';
 }
 
-function refineRouteForQuestion(route = {}, question = '') {
+async function refineRouteForQuestion(route = {}, question = '') {
   const normalizedQuestion = normalizeText(question);
   const vs = parseVsSides(question);
   const season = toSeason(pickFirst(route.season, guessSeason(question)));
   const format = pickFirst(route.format, guessFormat(question));
 
   if (vs?.left && vs?.right) {
-    const leftPlayer = resolveEntityWithFallback('player', [route.player1, route.player, vs.left]);
-    const rightPlayer = resolveEntityWithFallback('player', [route.player2, route.player, vs.right]);
-    const leftTeam = resolveEntityWithFallback('team', [route.team1, route.team, vs.left]);
-    const rightTeam = resolveEntityWithFallback('team', [route.team2, route.team, vs.right]);
+    const [leftPlayer, rightPlayer, leftTeam, rightTeam] = await Promise.all([
+      resolveEntityWithFallback('player', [route.player1, route.player, vs.left]),
+      resolveEntityWithFallback('player', [route.player2, route.player, vs.right]),
+      resolveEntityWithFallback('team', [route.team1, route.team, vs.left]),
+      resolveEntityWithFallback('team', [route.team2, route.team, vs.right])
+    ]);
 
     const playersResolved = isResolved(leftPlayer.resolution) && isResolved(rightPlayer.resolution);
     const teamsResolved = isResolved(leftTeam.resolution) && isResolved(rightTeam.resolution);
+    const playerScore =
+      Number(leftPlayer.resolution?.score || 0) + Number(rightPlayer.resolution?.score || 0);
+    const teamScore =
+      Number(leftTeam.resolution?.score || 0) + Number(rightTeam.resolution?.score || 0);
+    const rawLeft = normalizeText(vs.left || '');
+    const rawRight = normalizeText(vs.right || '');
+    const exactTeamSurface =
+      teamsResolved &&
+      normalizeText(leftTeam.resolution.item?.name || '') === rawLeft &&
+      normalizeText(rightTeam.resolution.item?.name || '') === rawRight;
 
-    if (teamsResolved && !playersResolved) {
+    if (teamsResolved && (!playersResolved || exactTeamSurface || teamScore >= playerScore + 0.15)) {
       return {
         ...route,
         action: /\bmatch\b|\bscorecard\b|\bsummary\b/.test(normalizedQuestion) ? 'match_summary' : 'head_to_head',
@@ -729,7 +1877,7 @@ function refineRouteForQuestion(route = {}, question = '') {
       };
     }
 
-    if (playersResolved && !teamsResolved) {
+    if (playersResolved && (!teamsResolved || playerScore > teamScore)) {
       return {
         ...route,
         action: 'compare_players',
@@ -745,8 +1893,10 @@ function refineRouteForQuestion(route = {}, question = '') {
   }
 
   if ((route.action === 'player_stats' || route.action === 'player_season_stats') && !vs) {
-    const playerLookup = resolveEntityWithFallback('player', [route.player, removeGenericWords(question), question]);
-    const teamLookup = resolveEntityWithFallback('team', [route.team, removeGenericWords(question), question]);
+    const [playerLookup, teamLookup] = await Promise.all([
+      resolveEntityWithFallback('player', [route.player, removeGenericWords(question), question]),
+      resolveEntityWithFallback('team', [route.team, removeGenericWords(question), question])
+    ]);
     if (isResolved(teamLookup.resolution) && !isResolved(playerLookup.resolution)) {
       return {
         ...route,
@@ -837,6 +1987,9 @@ function compactCricApiContext(context = {}) {
       : [],
     live_scores: Array.isArray(context.live_scores)
       ? context.live_scores.slice(0, 4).map(compactMatchForData)
+      : [],
+    archive_recent_matches: Array.isArray(context.archive_recent_matches)
+      ? context.archive_recent_matches.slice(0, 4).map(slimMatch)
       : [],
     schedule: Array.isArray(context.schedule)
       ? context.schedule.slice(0, 4).map(compactMatchForData)
@@ -983,6 +2136,24 @@ function buildPublicDetails(question = '', route = {}, structuredContext = {}, v
   const normalizedQuestion = normalizeText(question);
   const providerStatus = buildProviderStatus(cricApiContext?.errors || []);
 
+  if (type === 'chat') {
+    return {
+      type,
+      title: 'Cricket Intelligence',
+      subtitle: 'Ready when you are',
+      summary: fallbackSummary,
+      message: fallbackSummary
+    };
+  }
+  if (type === 'subjective_analysis') {
+    return {
+      type,
+      title: 'Analyst View',
+      subtitle: 'Data-driven perspective',
+      summary: fallbackSummary,
+      question: String(data.question || question || '').trim()
+    };
+  }
   if (type === 'player_stats') {
     const player = data.player || {};
     return {
@@ -1005,6 +2176,19 @@ function buildPublicDetails(question = '', route = {}, structuredContext = {}, v
       team,
       stats: data.stats || {},
       recent_matches: Array.isArray(data.stats?.recent_matches) ? data.stats.recent_matches.slice(0, 5).map(slimMatch) : []
+    };
+  }
+  if (type === 'team_info') {
+    const team = data.team || {};
+    return {
+      type,
+      title: String(team.name || 'Team Information'),
+      subtitle: 'Team information',
+      summary: fallbackSummary,
+      question: String(data.question || question || '').trim(),
+      team,
+      stats: data.stats || {},
+      recent_matches: Array.isArray(data.recent_matches) ? data.recent_matches.slice(0, 5).map(slimMatch) : []
     };
   }
   if (type === 'match_summary') {
@@ -1059,6 +2243,21 @@ function buildPublicDetails(question = '', route = {}, structuredContext = {}, v
       rows: rankedRows(Array.isArray(data.rows) ? data.rows.slice(0, 10) : [])
     };
   }
+  if (type === 'record_lookup') {
+    const metric = String(data.metric || data.resolved_metric || '');
+    return {
+      type,
+      title: String(data.title || (metric ? `Cricket Record: ${titleCaseMetric(metric)}` : 'Cricket Record')),
+      subtitle: 'Record lookup',
+      summary: fallbackSummary,
+      image_url: String(data.image_url || '').trim(),
+      question: String(data.question || question || '').trim(),
+      metric,
+      resolved_metric: String(data.resolved_metric || '').trim(),
+      stats: data.stats && typeof data.stats === 'object' ? data.stats : {},
+      rows: rankedRows(Array.isArray(data.rows) ? data.rows.slice(0, 10) : [])
+    };
+  }
   if (type === 'glossary') {
     return {
       type,
@@ -1072,18 +2271,21 @@ function buildPublicDetails(question = '', route = {}, structuredContext = {}, v
 
   const liveMatch = Array.isArray(cricApiContext.live_scores) ? cricApiContext.live_scores[0] : null;
   const nextMatch = Array.isArray(cricApiContext.schedule) ? cricApiContext.schedule[0] : null;
+  const archiveRecentMatches = Array.isArray(cricApiContext.archive_recent_matches)
+    ? cricApiContext.archive_recent_matches
+    : [];
   const playerProfile = Array.isArray(cricApiContext.player_profiles) ? cricApiContext.player_profiles[0] : null;
   const shouldRenderLiveSurface =
     LIVE_QUERY_REGEX.test(normalizedQuestion) ||
     SCHEDULE_QUERY_REGEX.test(normalizedQuestion) ||
-    Boolean(liveMatch || nextMatch || playerProfile);
+    Boolean(liveMatch || nextMatch || playerProfile || archiveRecentMatches.length);
   if (shouldRenderLiveSurface) {
     const upcomingMatches = Array.isArray(cricApiContext.schedule)
       ? cricApiContext.schedule.slice(0, 4).map(slimMatch)
       : [];
-    const recentMatches = Array.isArray(cricApiContext.live_scores)
+    const recentMatches = Array.isArray(cricApiContext.live_scores) && cricApiContext.live_scores.length
       ? cricApiContext.live_scores.slice(0, 4).map(slimMatch)
-      : [];
+      : archiveRecentMatches.slice(0, 4).map(slimMatch);
     return {
       type: 'live_update',
       title: upcomingMatches.length ? 'Upcoming Matches' : recentMatches.length ? 'Live Match Center' : 'Match Center',
@@ -1130,6 +2332,7 @@ async function buildCricApiContext(route, question) {
     player_searches: [],
     player_profiles: [],
     live_scores: [],
+    archive_recent_matches: [],
     schedule: [],
     series: [],
     series_info: null
@@ -1229,13 +2432,19 @@ async function buildCricApiContext(route, question) {
     }
   }
 
+  if (teamHint) {
+    context.archive_recent_matches = (await findMatchesForTeam(teamHint, { limit: 4, format: formatHint }))
+      .map(toPublicMatch);
+  }
+
   if (
     !context.player_searches.length &&
-    !context.player_profiles.length &&
-    !context.live_scores.length &&
-    !context.schedule.length &&
-    !context.series.length &&
-    !context.series_info
+      !context.player_profiles.length &&
+      !context.live_scores.length &&
+      !context.archive_recent_matches.length &&
+      !context.schedule.length &&
+      !context.series.length &&
+      !context.series_info
   ) {
     const fallbackLive = await safeCricApiCall(() =>
       getLiveScores({
@@ -1253,9 +2462,10 @@ async function buildCricApiContext(route, question) {
 
   context.errors = uniqueNonEmpty(context.errors);
   context.available = Boolean(
-    context.player_searches.length ||
+      context.player_searches.length ||
       context.player_profiles.length ||
       context.live_scores.length ||
+      context.archive_recent_matches.length ||
       context.schedule.length ||
       context.series.length ||
       context.series_info
@@ -1263,36 +2473,83 @@ async function buildCricApiContext(route, question) {
   return context;
 }
 
-function buildStructuredContext(route, question) {
-  const cache = datasetStore.getCache();
-  if (!cache) {
-    datasetStore.start().catch(() => {
-      // Leave the request on live/vector fallback while the local cache warms in the background.
-    });
+async function buildStructuredContext(route, question) {
+  const effectiveRoute = await refineRouteForQuestion(route, question);
+  if (effectiveRoute.action === 'chit_chat') {
     return {
       cache_ready: false,
       available: false,
-      result: null,
-      route
+      result: {
+        answer: '',
+        data: { type: 'chat' },
+        followups: ['Show live scores', 'Virat Kohli stats', 'Upcoming matches']
+      },
+      route: effectiveRoute
+    };
+  }
+  if (effectiveRoute.action === 'subjective_analysis') {
+    const shortEntityHints = uniqueNonEmpty(
+      (String(question || '').match(/\b[A-Za-z]{2,5}\b/g) || []).map((token) => token.trim())
+    );
+    const [playerLookup, teamLookup] = await Promise.all([
+      resolveEntityWithFallback('player', [route.player, route.player1, route.player2, removeGenericWords(question)]),
+      resolveEntityWithFallback('team', [route.team, route.team1, route.team2, ...shortEntityHints, ...buildPhraseCandidates(question), removeGenericWords(question)])
+    ]);
+    const subject =
+      teamLookup.resolution?.status === 'resolved'
+        ? String(teamLookup.resolution.item?.name || '').trim()
+        : playerLookup.resolution?.status === 'resolved'
+          ? String(playerLookup.resolution.item?.name || '').trim()
+          : '';
+    return {
+      cache_ready: true,
+      available: false,
+      result: {
+        answer: '',
+        data: {
+          type: 'subjective_analysis',
+          question: String(question || '').trim(),
+          subject
+        },
+        followups: ['Compare two players', 'Show team head to head', 'Show recent live scores']
+      },
+      route: effectiveRoute
+    };
+  }
+  if (effectiveRoute.action === 'team_info') {
+    const result = await runTeamInfo(effectiveRoute, question);
+    return {
+      cache_ready: true,
+      available: Boolean(result?.data?.team?.name),
+      result,
+      route: effectiveRoute
+    };
+  }
+  if (effectiveRoute.action === 'record_lookup') {
+    const result = await runRecordLookup(effectiveRoute, question);
+    return {
+      cache_ready: true,
+      available: Boolean(Array.isArray(result?.data?.rows) && result.data.rows.length),
+      result,
+      route: effectiveRoute
     };
   }
 
-  const effectiveRoute = refineRouteForQuestion(route, question);
   let result = unavailableResult();
   if (effectiveRoute.action === 'player_stats' || effectiveRoute.action === 'player_season_stats') {
-    result = runPlayerAction(effectiveRoute.action, effectiveRoute, question);
+    result = await runPlayerAction(effectiveRoute.action, effectiveRoute, question);
   } else if (effectiveRoute.action === 'team_stats') {
-    result = runTeamStats(effectiveRoute, question);
+    result = await runTeamStats(effectiveRoute, question);
   } else if (effectiveRoute.action === 'match_summary') {
-    result = runMatchSummary(effectiveRoute, question);
+    result = await runMatchSummary(effectiveRoute, question);
   } else if (effectiveRoute.action === 'compare_players') {
-    result = runComparePlayers(effectiveRoute, question);
+    result = await runComparePlayers(effectiveRoute, question);
   } else if (effectiveRoute.action === 'head_to_head') {
-    result = runHeadToHead(effectiveRoute, question);
+    result = await runHeadToHead(effectiveRoute, question);
   } else if (effectiveRoute.action === 'top_players') {
-    result = runTopPlayers(effectiveRoute, question);
+    result = await runTopPlayers(effectiveRoute, question);
   } else if (effectiveRoute.action === 'glossary') {
-    result = runGlossary(effectiveRoute, question);
+    result = await runGlossary(effectiveRoute, question);
   }
 
   const available = Boolean(
@@ -1307,6 +2564,164 @@ function buildStructuredContext(route, question) {
     available,
     result,
     route: effectiveRoute
+  };
+}
+
+function buildChitChatAnswer(question = '') {
+  const normalizedQuestion = normalizeText(question);
+
+  if (/\b(thanks|thank you)\b/.test(normalizedQuestion)) {
+    return "You're welcome. I can help with live scores, player stats, comparisons, and upcoming matches. What do you want to check next?";
+  }
+  if (/\bwho are you\b/.test(normalizedQuestion)) {
+    return 'I am your Cricket AI assistant. Ask me about live matches, player records, team trends, or upcoming fixtures.';
+  }
+  if (/\bhow are you\b/.test(normalizedQuestion)) {
+    return 'Ready and on signal. Tell me which player, team, or live match you want to explore.';
+  }
+  return 'Hi. I am your Cricket AI assistant. Tell me which player, live match, or stat line you want to explore today.';
+}
+
+async function canonicalizeLeaderboardRows(rows = []) {
+  return Promise.all(
+    rows.map(async (row) => {
+      if (!row?.player) return row;
+      const profile = await getPlayerProfile({
+        query: row.player,
+        datasetName: row.player
+      });
+      return {
+        ...row,
+        player: String(profile?.canonical_name || row.player).trim() || row.player
+      };
+    })
+  );
+}
+
+async function buildSubjectiveAnalysisAnswer(question = '', route = {}, structuredContext = {}, vectorContext = {}, cricApiContext = {}) {
+  const { playerHints, teamHints } = deriveEntityHints(question, route);
+  const subject = pickFirst(structuredContext?.result?.data?.subject, playerHints[0], teamHints[0], 'this debate');
+  const evidence = [];
+  const structuredAnswer = String(structuredContext?.result?.answer || '').trim();
+  const vectorPreview = String(vectorContext?.results?.[0]?.document_preview || '').trim();
+  const liveItem = cricApiContext?.live_scores?.[0] || cricApiContext?.schedule?.[0] || null;
+  const normalizedQuestion = normalizeText(question);
+
+  if (structuredAnswer && structuredAnswer !== NOT_AVAILABLE_MESSAGE) {
+    evidence.push(`Verified archive context: ${structuredAnswer}`);
+  }
+  if (vectorPreview) {
+    evidence.push(`Archive narrative context: ${vectorPreview.slice(0, 220).trim()}${vectorPreview.length > 220 ? '...' : ''}`);
+  }
+  if (liveItem?.name) {
+    evidence.push(
+      `Live context: ${liveItem.name}${liveItem.status ? ` (${liveItem.status})` : ''}`
+    );
+  }
+
+  if (/\b(best|top)\s+(bowler|bolwer)\b/.test(normalizedQuestion) && subject && subject !== 'this debate') {
+    const bowlers = await canonicalizeLeaderboardRows(await getTopPlayersForTeam(subject, 'wickets', { limit: 3 }));
+    if (bowlers.length) {
+      return {
+        answer: `${bowlers[0].player} is the strongest archived bowling answer for ${subject}, with ${formatStatValue(bowlers[0].wickets)} wickets across ${formatStatValue(bowlers[0].matches)} matches. Other strong archived options are ${bowlers.slice(1).map((row) => row.player).join(' and ')}.`,
+        followups: ['Show player stats', 'Compare two players', 'Show recent live scores'],
+        sources: buildSourceList(structuredContext, vectorContext, cricApiContext)
+      };
+    }
+  }
+
+  if (/\b(best|top)\s+(batsman|batter|finisher)\b/.test(normalizedQuestion) && subject && subject !== 'this debate') {
+    const batters = await canonicalizeLeaderboardRows(await getTopPlayersForTeam(subject, 'runs', { limit: 3 }));
+    if (batters.length) {
+      return {
+        answer: `${batters[0].player} looks like the strongest archived batting pick for ${subject}, with ${formatStatValue(batters[0].runs)} runs across ${formatStatValue(batters[0].matches)} matches. Other strong archived names are ${batters.slice(1).map((row) => row.player).join(' and ')}.`,
+        followups: ['Show player stats', 'Compare two players', 'Show recent live scores'],
+        sources: buildSourceList(structuredContext, vectorContext, cricApiContext)
+      };
+    }
+  }
+
+  if (/\bwho will win\b|\bpredict(?:ion)?\b/.test(normalizedQuestion)) {
+    const base = `Cricket is unpredictable, so there is no guaranteed winner for ${subject}.`;
+    if (evidence.length) {
+      return {
+        answer: `${base}\n\nThe most useful signals I can ground right now are:\n- ${evidence.join('\n- ')}`,
+        followups: ['Compare two teams', 'Show recent live scores', 'Show team head to head'],
+        sources: buildSourceList(structuredContext, vectorContext, cricApiContext)
+      };
+    }
+    return {
+      answer: `${base} The safest way to judge it is to compare recent form, head-to-head record, and lineup strength for the teams you care about.`,
+      followups: ['Compare two teams', 'Show recent live scores', 'Show upcoming matches'],
+      sources: buildSourceList(structuredContext, vectorContext, cricApiContext)
+    };
+  }
+
+  if (evidence.length) {
+    return {
+      answer: `That question is more debate than single-number fact for ${subject}.\n\nHere is the strongest context I can ground from the available cricket data:\n- ${evidence.join('\n- ')}`,
+      followups: ['Compare two players', 'Show team head to head', 'Show recent live scores'],
+      sources: buildSourceList(structuredContext, vectorContext, cricApiContext)
+    };
+  }
+
+  return {
+    answer: `That is a cricket debate rather than a single definitive stat for ${subject}. I would frame it using recent form, match pressure, head-to-head context, and role balance instead of one absolute claim.`,
+    followups: ['Compare two players', 'Show team head to head', 'Show recent live scores'],
+    sources: buildSourceList(structuredContext, vectorContext, cricApiContext)
+  };
+}
+
+async function buildTeamInfoFallbackAnswer(structuredContext = {}) {
+  const directAnswer = String(structuredContext?.result?.answer || '').trim();
+  if (directAnswer && directAnswer !== NOT_AVAILABLE_MESSAGE) {
+    return {
+      answer: directAnswer,
+      followups: ['Show team head to head', 'Show recent live scores', 'Show upcoming matches'],
+      sources: buildSourceList(structuredContext, {}, {})
+    };
+  }
+
+  const team = structuredContext?.result?.data?.team || {};
+  const teamName = String(team.name || 'that team').trim();
+  const question = String(structuredContext?.result?.data?.question || '').trim();
+  const wiki = await fetchWikipediaSummary(teamName);
+  const wikiAnswer = buildTeamInfoAnswerFromWiki(question, teamName, wiki);
+  return {
+    answer:
+      wikiAnswer ||
+      `I found archived information for ${teamName}, but I could not fully verify the exact latest non-stat detail from the current archive alone.`,
+    followups: ['Show team head to head', 'Show recent live scores', 'Show upcoming matches'],
+    sources: buildSourceList(structuredContext, {}, {})
+  };
+}
+
+function buildRecordFallbackAnswer(question = '', structuredContext = {}) {
+  const directAnswer = String(structuredContext?.result?.answer || '').trim();
+  if (directAnswer && directAnswer !== NOT_AVAILABLE_MESSAGE) {
+    return {
+      answer: directAnswer,
+      followups: ['Show player stats', 'Compare two players', 'Show live scores'],
+      sources: buildSourceList(structuredContext, {}, {})
+    };
+  }
+
+  const metric = String(structuredContext?.result?.data?.metric || '').trim();
+  const rows = Array.isArray(structuredContext?.result?.data?.rows) ? structuredContext.result.data.rows : [];
+  if (rows.length) {
+    return {
+      answer: `Here is the closest archived record view for ${metric || 'that record'}: ${rows
+        .slice(0, 3)
+        .map((row, index) => `#${index + 1} ${row.player || row.team || 'Record'} - ${formatStatValue(row.value)}`)
+        .join('; ')}.`,
+      followups: ['Show player stats', 'Compare two players', 'Show live scores'],
+      sources: buildSourceList(structuredContext, {}, {})
+    };
+  }
+  return {
+    answer: `I could not verify that exact cricket record from the current archived data alone.`,
+    followups: ['Show player stats', 'Compare two players', 'Show live scores'],
+    sources: buildSourceList(structuredContext, {}, {})
   };
 }
 
@@ -1390,7 +2805,7 @@ async function enrichStructuredResult(structuredContext = {}, route = {}, questi
 
 function buildSourceList(structuredContext, vectorContext, cricApiContext, modelSources = []) {
   const sources = [];
-  if (structuredContext?.available) sources.push('dataset');
+  if (structuredContext?.available) sources.push('vector_archive');
   if (vectorContext?.available && Array.isArray(vectorContext.results) && vectorContext.results.length) {
     sources.push('vector_db');
   }
@@ -1407,6 +2822,14 @@ function buildSourceList(structuredContext, vectorContext, cricApiContext, model
 function defaultFollowups(route = {}, structuredContext = {}) {
   const structuredFollowups = structuredContext?.result?.followups || [];
   if (structuredFollowups.length) return structuredFollowups.slice(0, 3);
+
+  if (route.action === 'subjective_analysis') {
+    return [
+      'Compare two players',
+      'Show team head to head',
+      'Show recent live scores'
+    ];
+  }
 
   if (route.action === 'match_summary') {
     return [
@@ -1531,8 +2954,11 @@ function buildLiveAnswer(question = '', route = {}, cricApiContext = {}) {
   const normalizedQuestion = normalizeText(question);
   const liveItems = Array.isArray(cricApiContext.live_scores) ? cricApiContext.live_scores : [];
   const scheduleItems = Array.isArray(cricApiContext.schedule) ? cricApiContext.schedule : [];
+  const archiveRecentMatches = Array.isArray(cricApiContext.archive_recent_matches)
+    ? cricApiContext.archive_recent_matches
+    : [];
   const activeMatch = liveItems.find((item) => item.live) || null;
-  const recentMatch = liveItems[0] || null;
+  const recentMatch = liveItems[0] || archiveRecentMatches[0] || null;
   const nextMatch = scheduleItems[0] || null;
   const providerStatus = buildProviderStatus(cricApiContext?.errors || []);
 
@@ -1603,7 +3029,7 @@ function buildLiveAnswer(question = '', route = {}, cricApiContext = {}) {
   }
 
   const bits = [];
-  if (!liveItems.length && !scheduleItems.length && providerStatus) {
+  if (!liveItems.length && !scheduleItems.length && !archiveRecentMatches.length && providerStatus) {
     return providerStatus.message;
   }
   if (teamHint) {
@@ -1702,15 +3128,26 @@ function buildGroundedAnswer(question, route, structuredContext, vectorContext, 
 }
 
 async function synthesizeAnswer(question, route, structuredContext, vectorContext, cricApiContext) {
-  const grounded = buildGroundedAnswer(
-    question,
-    route,
-    structuredContext,
-    vectorContext,
-    cricApiContext
-  );
-  if (grounded) {
-    return grounded;
+  if (route.action === 'chit_chat') {
+    return {
+      answer: buildChitChatAnswer(question),
+      followups: ['Show live scores', 'Virat Kohli stats', 'Upcoming matches'],
+      sources: []
+    };
+  }
+  const openEndedReasoning = ['subjective_analysis', 'team_info', 'record_lookup'].includes(route.action);
+
+  if (!openEndedReasoning) {
+    const grounded = buildGroundedAnswer(
+      question,
+      route,
+      structuredContext,
+      vectorContext,
+      cricApiContext
+    );
+    if (grounded) {
+      return grounded;
+    }
   }
 
   const vectorSummary = compactVectorContext(vectorContext);
@@ -1734,6 +3171,11 @@ async function synthesizeAnswer(question, route, structuredContext, vectorContex
         'For comparison answers, prefer blocks like "Player A vs Player B", metric sections, then Conclusion.',
         'For live answers, prefer blocks like "Match - Live", score lines, status, and top performer when available.',
         'If no live match is available for the requested team, say that clearly and use the closest recent or upcoming CricAPI item instead.',
+        'If the action is chit_chat, respond warmly as a Cricket AI assistant and ask what stats or matches the user wants to explore.',
+        'If the action is team_info, answer the direct team question clearly using the supplied team summary and general cricket knowledge when needed.',
+        'If the action is record_lookup, answer the record question directly. If the supplied rows are only a proxy, say that clearly.',
+        'If the action is subjective_analysis, behave like a cricket analyst: be balanced, human, and data-aware instead of robotic.',
+        'Quietly correct typos or slang player and team names in the final answer.',
         'Do not mention models, APIs, vector databases, routing, prompts, or internal system details.',
         'If the supplied evidence is insufficient, say so plainly instead of guessing.',
         'If you use general knowledge beyond the supplied sources, include "general_knowledge" in sources.',
@@ -1776,14 +3218,30 @@ async function synthesizeAnswer(question, route, structuredContext, vectorContex
     // Fall back to the grounded answer builders below.
   }
 
+  if (route.action === 'subjective_analysis') {
+    return await buildSubjectiveAnalysisAnswer(
+      question,
+      route,
+      structuredContext,
+      vectorContext,
+      cricApiContext
+    );
+  }
+  if (route.action === 'team_info') {
+    return await buildTeamInfoFallbackAnswer(structuredContext);
+  }
+  if (route.action === 'record_lookup') {
+    return buildRecordFallbackAnswer(question, structuredContext);
+  }
+
   return fallbackAnswer(question, route, structuredContext, vectorContext, cricApiContext);
 }
 
-async function handleQuery({ question = '', query = '' } = {}) {
-  return processQuery({ question, query });
+async function handleQuery({ question = '', query = '', sessionId = '' } = {}) {
+  return processQuery({ question, query, sessionId });
 }
 
-async function processQuery({ question = '', query = '' } = {}, { onStatus } = {}) {
+async function processQuery({ question = '', query = '', sessionId = '' } = {}, { onStatus } = {}) {
   const text = pickFirst(question, query);
   if (!text) {
     return {
@@ -1796,46 +3254,86 @@ async function processQuery({ question = '', query = '' } = {}, { onStatus } = {
     };
   }
 
-  emitStatus(onStatus, {
-    stage: 'search',
-    message: 'Searching stats.'
-  });
-  const route = normalizeRoute(await routeQuestion(text, {}));
-  let structuredContext = buildStructuredContext(route, text);
-  const effectiveRoute = structuredContext.route || route;
-  structuredContext = await enrichStructuredResult(structuredContext, effectiveRoute, text);
-  emitStatus(onStatus, {
-    stage: 'search',
-    action: effectiveRoute.action,
-    message: structuredContext.cache_ready ? actionStatusMessage(effectiveRoute.action) : 'Searching saved records.'
-  });
-  const vectorPromise = queryVectorDb(text, { k: 5 });
+  const session = getSession(String(sessionId || '').trim());
+  const effectiveText = applySessionContext(text, session);
 
-  emitStatus(onStatus, {
-    stage: 'live',
-    message: 'Checking latest match data.'
-  });
-  const cricApiPromise = buildCricApiContext(effectiveRoute, text);
-
-  const [vectorContext, cricApiContext] = await Promise.all([vectorPromise, cricApiPromise]);
-
-  emitStatus(onStatus, {
-    stage: 'synthesizing',
-    message: 'Preparing answer.'
-  });
-  const synthesized = await synthesizeAnswer(
+  const route = applySessionRouteFallback(
+    normalizeRoute(await routeQuestion(effectiveText, {})),
     text,
+    session
+  );
+  let structuredContext = await buildStructuredContext(route, effectiveText);
+  const effectiveRoute = structuredContext.route || route;
+  let vectorContext = {
+    available: false,
+    warning: '',
+    results: []
+  };
+  let cricApiContext = {
+    provider: 'cricapi',
+    available: false,
+    errors: [],
+    player_searches: [],
+    player_profiles: [],
+    live_scores: [],
+    schedule: [],
+    series: [],
+    series_info: null
+  };
+
+  if (effectiveRoute.action === 'chit_chat') {
+    emitStatus(onStatus, {
+      stage: 'responding',
+      action: effectiveRoute.action,
+      message: actionStatusMessage(effectiveRoute.action)
+    });
+  } else {
+    structuredContext = await enrichStructuredResult(structuredContext, effectiveRoute, effectiveText);
+    emitStatus(onStatus, {
+      stage: 'search',
+      action: effectiveRoute.action,
+      message: structuredContext.cache_ready ? actionStatusMessage(effectiveRoute.action) : 'Searching saved records.'
+    });
+    const vectorPromise = queryVectorDb(effectiveText, { k: 5 });
+
+    emitStatus(onStatus, {
+      stage: 'live',
+      message: 'Checking latest match data.'
+    });
+    const cricApiPromise = buildCricApiContext(effectiveRoute, effectiveText);
+
+    [vectorContext, cricApiContext] = await Promise.all([vectorPromise, cricApiPromise]);
+  }
+
+  if (effectiveRoute.action !== 'chit_chat') {
+    emitStatus(onStatus, {
+      stage: 'synthesizing',
+      message: 'Preparing answer.'
+    });
+  }
+  const synthesized = await synthesizeAnswer(
+    effectiveText,
     effectiveRoute,
     structuredContext,
     vectorContext,
     cricApiContext
   );
 
+  const publicDetails = buildPublicDetails(
+    text,
+    effectiveRoute,
+    structuredContext,
+    vectorContext,
+    cricApiContext,
+    synthesized
+  );
+  syncSessionState(session, effectiveRoute, structuredContext, publicDetails);
+
   return {
     statusCode: 200,
     response: buildResponse({
       answer: synthesized.answer,
-      data: buildPublicDetails(text, effectiveRoute, structuredContext, vectorContext, cricApiContext, synthesized),
+      data: publicDetails,
       followups:
         (Array.isArray(synthesized.followups) && synthesized.followups.length
           ? synthesized.followups
