@@ -2,6 +2,8 @@ const SUPPORTED_ACTIONS = [
   'player_stats',
   'player_season_stats',
   'team_stats',
+  'team_squad',
+  'playing_xi',
   'match_summary',
   'compare_players',
   'head_to_head',

@@ -122,6 +122,11 @@ function readPositiveInt(value, fallback, options) {
   return toPositiveInteger(value, fallback, options);
 }
 
+function toSortableTimestamp(value = '') {
+  const parsed = Date.parse(String(value || '').trim());
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
 function handleExternalError(res, error) {
   const statusCode = Number(error?.statusCode || 500);
   return res.status(statusCode).json({
@@ -204,6 +209,17 @@ function normalizeCachedExtra(response = {}, details = {}) {
   return extra;
 }
 
+function normalizeCachedImage(response = {}, details = {}) {
+  const candidates = [
+    response?.image,
+    details?.player?.image_url,
+    details?.team?.image_url,
+    details?.image_url,
+    details?.left?.image_url
+  ];
+  return candidates.map((value) => String(value || '').trim()).find(Boolean) || '';
+}
+
 function normalizeCachedResponseShape(response = {}, fallbackQuestion = '') {
   if (
     response &&
@@ -230,7 +246,7 @@ function normalizeCachedResponseShape(response = {}, fallbackQuestion = '') {
   return {
     type: toUnifiedTypeFromLegacy(details),
     title: String(details.title || response?.title || 'Cricket Intelligence').trim() || 'Cricket Intelligence',
-    image: String(details.player?.image_url || response?.image || '').trim(),
+    image: normalizeCachedImage(response, details),
     summary,
     stats: normalizeCachedStats(response, details),
     extra: normalizeCachedExtra(response, details)
@@ -358,7 +374,10 @@ app.get('/api/home', async (req, res) => {
           win_rate: team.win_rate
         }))
     },
-    recent_matches: recentMatches.slice(0, 5).map(toApiMatch)
+    recent_matches: [...recentMatches]
+      .sort((left, right) => toSortableTimestamp(right.date) - toSortableTimestamp(left.date))
+      .slice(0, 5)
+      .map(toApiMatch)
   });
 });
 
@@ -706,7 +725,32 @@ app.get('*', (req, res) => {
   return res.sendFile(path.join(frontendPath, 'index.html'));
 });
 
-app.listen(port, () => {
-  console.log(`Server running on http://localhost:${port}`);
+const server = app.listen(port);
+
+server.on('listening', () => {
+  const address = server.address();
+  const activePort =
+    address && typeof address === 'object' && Number.isFinite(Number(address.port))
+      ? Number(address.port)
+      : port;
+  console.log(`Server running on http://localhost:${activePort}`);
   startDailyIngestor();
+});
+
+server.on('error', (error) => {
+  if (error?.code === 'EADDRINUSE') {
+    console.error(
+      [
+        `Port ${port} is already in use.`,
+        `The backend is likely already running on http://localhost:${port}.`,
+        'Stop the existing process before starting again, or run on another port.',
+        `PowerShell example: $env:PORT='${port + 1}'; npm start`
+      ].join('\n')
+    );
+    process.exit(1);
+    return;
+  }
+
+  console.error('Server failed to start:', error);
+  process.exit(1);
 });

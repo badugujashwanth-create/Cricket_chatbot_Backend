@@ -139,6 +139,18 @@ function isTeamInfoQuestion(question = '') {
   );
 }
 
+function isPlayingXiQuestion(question = '') {
+  return /\b(playing\s*(?:xi|11|eleven)|who\s+playing\s+now|who\s+is\s+playing\s+now)\b/.test(
+    normalizeText(question)
+  );
+}
+
+function isTeamSquadQuestion(question = '') {
+  return /\b(players?|squad|team list|lineup|roster|playing\s*(?:xi|11|eleven))\b/.test(
+    normalizeText(question)
+  );
+}
+
 function isRecordQuestion(question = '') {
   return /\b(highest score|lowest total|fastest century|fastest 100|most wickets in world cup|most wickets|highest strike rate ever|record|records)\b/.test(
     normalizeText(question)
@@ -171,6 +183,15 @@ function fallbackRoute(question = '') {
     return {
       action: 'record_lookup',
       metric: detectTopMetric(raw),
+      season,
+      format
+    };
+  }
+
+  if (isTeamSquadQuestion(raw)) {
+    return {
+      action: isPlayingXiQuestion(raw) ? 'playing_xi' : 'team_squad',
+      team: raw,
       season,
       format
     };
@@ -335,7 +356,7 @@ function buildSystemPrompt() {
     'You are a cricket query router.',
     'Return ONLY one JSON object. No markdown. No explanation.',
     'Allowed actions:',
-    'player_stats, player_season_stats, team_stats, team_info, match_summary, compare_players, head_to_head, top_players, record_lookup, glossary, chit_chat, subjective_analysis, not_supported',
+    'player_stats, player_season_stats, team_stats, team_squad, playing_xi, team_info, match_summary, compare_players, head_to_head, top_players, record_lookup, glossary, chit_chat, subjective_analysis, not_supported',
     'Use these optional keys when relevant:',
     'player, player1, player2, team, team1, team2, season, format, match_id, date, metric, term, limit, min_balls, min_overs',
     'Rules:',
@@ -344,8 +365,9 @@ function buildSystemPrompt() {
     '3) Compare two players -> compare_players with player1 and player2.',
     '4) Team-vs-team record -> head_to_head with team1 and team2.',
     '5) Rankings/top lists -> top_players with metric.',
-    '5b) Team trophy/captain/history questions -> team_info.',
-    '5c) Record questions like highest score or fastest century -> record_lookup.',
+    '5b) Team squad/players/lineup/roster questions -> team_squad, unless it explicitly asks for playing XI, then use playing_xi.',
+    '5c) Team trophy/captain/history questions -> team_info.',
+    '5d) Record questions like highest score or fastest century -> record_lookup.',
     '6) Stat term meaning -> glossary with term.',
     '7) Greetings, thanks, introductions, and small talk -> chit_chat.',
     '8) Opinions, predictions, debate framing, or abstract reasons -> subjective_analysis unless the question clearly compares two named players or two named teams.',
@@ -372,7 +394,7 @@ function buildUserPrompt(question, context = {}) {
 
 async function routeQuestion(question, context = {}) {
   const heuristicRoute = fallbackRoute(question);
-  if (['chit_chat', 'subjective_analysis', 'top_players', 'glossary', 'team_info', 'record_lookup'].includes(heuristicRoute.action)) {
+  if (['chit_chat', 'subjective_analysis', 'top_players', 'glossary', 'team_info', 'team_squad', 'playing_xi', 'record_lookup'].includes(heuristicRoute.action)) {
     return heuristicRoute;
   }
 

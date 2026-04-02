@@ -7,7 +7,6 @@
     "start": "node server.js",
     "test:cases": "node scripts/test-cases.js",
     "test:cricapi": "node scripts/test-cricapi.js",
-    "test:name-resolution": "node scripts/test-name-resolution.js",
     "dataset:clean": "python scripts/build_clean_dataset.py",
     "chroma:build": "python scripts/build_clean_dataset.py && python scripts/build_chroma_local.py --reset",
     "rebuild:all": "python scripts/build_clean_dataset.py && python scripts/build_chroma_local.py --reset",
@@ -15,7 +14,6 @@
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "csv-parser": "^3.2.0",
     "express": "^4.19.2"
   }
 }

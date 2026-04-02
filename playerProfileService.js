@@ -92,7 +92,8 @@ async function fetchWikipediaSummary(playerName = '') {
       title: String(payload?.title || cleanPlayerName),
       image_url: String(payload?.thumbnail?.source || ''),
       wikipedia_url: String(payload?.content_urls?.desktop?.page || ''),
-      description: String(payload?.description || '')
+      short_description: String(payload?.description || ''),
+      description: String(payload?.extract || payload?.description || '')
     };
   } catch (_) {
     return null;
@@ -153,6 +154,7 @@ async function getPlayerProfile({ query = '', datasetName = '' } = {}) {
     canonical_name: canonicalName || String(datasetName || query || '').trim(),
     image_url: String(wiki?.image_url || external?.image_url || ''),
     wikipedia_url: String(wiki?.wikipedia_url || ''),
+    short_description: String(wiki?.short_description || ''),
     description: String(wiki?.description || ''),
     country: String(external?.country || '')
   });

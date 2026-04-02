@@ -16,6 +16,7 @@ const {
 const { normalizeText } = require('./textUtils');
 const { cleanEntitySegment, parseVsSides } = require('./queryParser');
 const {
+  loadPlayerProfiles,
   loadMatchSummaries,
   resolvePlayer: resolveVectorPlayer,
   resolveTeam: resolveVectorTeam,
@@ -266,6 +267,24 @@ function buildKeyStats(details = {}) {
     return rows.slice(0, 4);
   }
 
+  if (type === 'team_squad') {
+    return [
+      { label: 'Captain', value: String(details.team?.captain || details.captain || '-').trim() || '-' },
+      { label: 'Coach', value: String(details.team?.coach || details.coach || '-').trim() || '-' },
+      { label: 'Total Players', value: Number(details.total_players || 0) },
+      { label: 'Matches', value: Number(details.stats?.matches || 0) }
+    ];
+  }
+
+  if (type === 'playing_xi') {
+    return [
+      { label: 'Captain', value: String(details.team?.captain || details.captain || '-').trim() || '-' },
+      { label: 'Coach', value: String(details.team?.coach || details.coach || '-').trim() || '-' },
+      { label: 'Selected XI', value: Array.isArray(details.players) ? details.players.length : 0 },
+      { label: 'Matches', value: Number(details.stats?.matches || 0) }
+    ];
+  }
+
   if (type === 'compare_players') {
     return [
       {
@@ -366,6 +385,15 @@ function buildInsights(details = {}, summary = '', answer = '') {
     ]).slice(0, 3);
   }
 
+  if ((type === 'team_squad' || type === 'playing_xi') && details.team?.name) {
+    return uniqueNonEmpty([
+      details.team?.captain ? `${details.team.name} are captained by ${details.team.captain}.` : '',
+      details.team?.coach ? `${details.team.name} are coached by ${details.team.coach}.` : '',
+      Number(details.total_players || 0) ? `${details.team.name} have ${formatStatValue(details.total_players)} listed players in the archived squad view.` : '',
+      summary
+    ]).slice(0, 3);
+  }
+
   if (type === 'top_players' && Array.isArray(details.rows) && details.rows[0]?.player) {
     return [`${details.rows[0].player} leads this leaderboard in the current query scope.`];
   }
@@ -387,6 +415,7 @@ function buildInsights(details = {}, summary = '', answer = '') {
 function toUnifiedResponseType(details = {}) {
   const rawType = String(details.type || '').trim();
 
+  if (rawType === 'team_squad' || rawType === 'playing_xi') return rawType;
   if (rawType === 'player_stats' || rawType === 'player_season_stats') return 'player';
   if (rawType === 'team_stats' || rawType === 'team_info') return 'team';
   if (rawType === 'match_summary' || rawType === 'live_update') return 'match';
@@ -509,6 +538,7 @@ function buildUnifiedExtra(details = {}, summary = '', answer = '', suggestions 
     extra.entities = {
       team: details.team || {}
     };
+    extra.team_description = String(details.team?.description || '').trim();
     extra.recent_matches = Array.isArray(details.recent_matches) ? details.recent_matches : [];
     return pruneEmptyFields(extra);
   }
@@ -518,7 +548,18 @@ function buildUnifiedExtra(details = {}, summary = '', answer = '', suggestions 
       team: details.team || {}
     };
     extra.question = String(details.question || '').trim();
+    extra.team_description = String(details.team?.description || '').trim();
     extra.recent_matches = Array.isArray(details.recent_matches) ? details.recent_matches : [];
+    return pruneEmptyFields(extra);
+  }
+
+  if (rawType === 'team_squad' || rawType === 'playing_xi') {
+    extra.entities = {
+      team: details.team || {}
+    };
+    extra.team_description = String(details.team?.description || '').trim();
+    extra.players = Array.isArray(details.players) ? details.players : [];
+    extra.total_players = Number(details.total_players || 0);
     return pruneEmptyFields(extra);
   }
 
@@ -742,7 +783,8 @@ async function fetchWikipediaSummary(topic = '') {
       title: String(payload?.title || cleanTopic).trim(),
       description: String(payload?.description || '').trim(),
       extract: String(payload?.extract || '').trim(),
-      image: String(payload?.thumbnail?.source || '').trim()
+      image: String(payload?.thumbnail?.source || '').trim(),
+      wikipedia_url: String(payload?.content_urls?.desktop?.page || '').trim()
     };
     wikipediaSummaryCache.set(cacheKey, summary);
     return summary;
@@ -1196,6 +1238,8 @@ function actionStatusMessage(action = '') {
     return 'Searching player stats.';
   }
   if (action === 'team_stats') return 'Searching team stats.';
+  if (action === 'team_squad') return 'Loading team squad.';
+  if (action === 'playing_xi') return 'Building playing XI.';
   if (action === 'team_info') return 'Checking team information.';
   if (action === 'match_summary') return 'Searching match details.';
   if (action === 'compare_players') return 'Comparing players.';
@@ -1359,6 +1403,51 @@ function toTeamStats(team = {}) {
     win_rate: Number(team.win_rate || 0),
     average_score: matches > 0 ? Number((runs / matches).toFixed(2)) : 0,
     runs
+  };
+}
+
+function normalizeSquadRole(role = '') {
+  const normalizedRole = normalizeText(role);
+  if (!normalizedRole) return 'Player';
+  if (/\bkeeper\b|\bwicket/.test(normalizedRole)) return 'Wicketkeeper';
+  if (/\ball\b/.test(normalizedRole)) return 'All-rounder';
+  if (/\bbowl/.test(normalizedRole)) return 'Bowler';
+  if (/\bbat/.test(normalizedRole)) return 'Batsman';
+  return String(role || 'Player').trim() || 'Player';
+}
+
+async function buildSquadPlayersForTeam(teamName = '', { limit = 0 } = {}) {
+  const players = await loadPlayerProfiles();
+  const cleanTeam = normalizeText(teamName);
+  const squad = players
+    .filter((player) => normalizeText(player.team) === cleanTeam)
+    .sort(
+      (left, right) =>
+        Number(right.matches || 0) - Number(left.matches || 0) ||
+        Number(right.runs || 0) - Number(left.runs || 0) ||
+        Number(right.wickets || 0) - Number(left.wickets || 0) ||
+        String(left.canonical_name || left.name || '').localeCompare(String(right.canonical_name || right.name || ''))
+    );
+
+  const selected = limit > 0 ? squad.slice(0, limit) : squad;
+  const profiles = await Promise.all(
+    selected.map(async (player) => {
+      const canonicalName = String(player.canonical_name || player.name || '').trim();
+      const wikiSummary = await fetchWikipediaSummary(canonicalName).catch(() => null);
+      return {
+        name: canonicalName,
+        role: normalizeSquadRole(player.role),
+        image: String(wikiSummary?.image || '').trim(),
+        matches: Number(player.matches || 0),
+        runs: Number(player.runs || 0),
+        wickets: Number(player.wickets || 0)
+      };
+    })
+  );
+
+  return {
+    totalPlayers: squad.length,
+    players: profiles
   };
 }
 
@@ -1765,7 +1854,9 @@ async function runTeamInfo(route, question) {
         id: team.id,
         name: team.name,
         image_url: String(wikiSummary?.image || '').trim(),
-        description: String(wikiSummary?.description || '').trim(),
+        wikipedia_url: String(wikiSummary?.wikipedia_url || '').trim(),
+        short_description: String(wikiSummary?.description || '').trim(),
+        description: String(wikiSummary?.extract || wikiSummary?.description || '').trim(),
         captain: String(wikiFields.captain || '').trim(),
         coach: String(wikiFields.coach || '').trim(),
         owner: String(wikiFields.owner || '').trim(),
@@ -1780,6 +1871,67 @@ async function runTeamInfo(route, question) {
       recent_matches: recentMatches
     },
     followups: ['Show team head to head', 'Show recent live scores', 'Show upcoming matches']
+  };
+}
+
+async function runTeamSquad(route, question, { playingXi = false } = {}) {
+  const vs = parseVsSides(question) || {};
+  const multiWordPhrases = buildPhraseCandidates(question, { minWords: 2, maxWords: 4 });
+  const { query: teamQuery, resolution } = await resolveEntityWithFallback('team', [
+    route.team,
+    route.team1,
+    route.team2,
+    vs.left,
+    vs.right,
+    ...multiWordPhrases,
+    removeGenericWords(question)
+  ]);
+  if (resolution.status !== 'resolved') {
+    return unresolvedEntityResult('team', teamQuery, resolution);
+  }
+
+  const team = resolution.item;
+  const stats = toTeamStats(team);
+  const [wikiSummary, wikiWikitext, squadResult] = await Promise.all([
+    fetchWikipediaSummary(team.name),
+    fetchWikipediaWikitext(team.name),
+    buildSquadPlayersForTeam(team.name, { limit: playingXi ? 11 : 0 })
+  ]);
+  const wikiFields = parseWikipediaInfoboxFields(wikiWikitext);
+  const squadPlayers = Array.isArray(squadResult.players) ? squadResult.players : [];
+  const totalPlayers = Number(squadResult.totalPlayers || squadPlayers.length || 0);
+
+  if (!squadPlayers.length) {
+    return unavailableResult(`I could not find a verified squad list for ${team.name} in the current vector archive.`);
+  }
+
+  return {
+    answer: playingXi
+      ? `${team.name} playing XI proxy from the archived roster: ${squadPlayers.map((player) => player.name).join(', ')}.`
+      : `${team.name} squad from the archived vector index includes ${formatStatValue(totalPlayers)} listed players.`,
+    data: {
+      type: playingXi ? 'playing_xi' : 'team_squad',
+      title: team.name,
+      subtitle: playingXi ? 'Playing XI' : 'Squad',
+      question: String(question || '').trim(),
+      team: {
+        id: team.id,
+        name: team.name,
+        image_url: String(wikiSummary?.image || '').trim(),
+        wikipedia_url: String(wikiSummary?.wikipedia_url || '').trim(),
+        short_description: String(wikiSummary?.description || '').trim(),
+        description: String(wikiSummary?.extract || wikiSummary?.description || '').trim(),
+        captain: String(wikiFields.captain || '').trim(),
+        coach: String(wikiFields.coach || '').trim(),
+        home_ground: String(wikiFields.ground || '').trim()
+      },
+      captain: String(wikiFields.captain || '').trim(),
+      coach: String(wikiFields.coach || '').trim(),
+      stats,
+      players: playingXi ? squadPlayers.map((player) => player.name) : squadPlayers,
+      total_players: playingXi ? squadPlayers.length : totalPlayers
+    },
+    followups: ['Show team info', 'Show recent matches', 'Compare two teams']
   };
 }
 
@@ -2191,6 +2343,21 @@ function buildPublicDetails(question = '', route = {}, structuredContext = {}, v
       recent_matches: Array.isArray(data.recent_matches) ? data.recent_matches.slice(0, 5).map(slimMatch) : []
     };
   }
+  if (type === 'team_squad' || type === 'playing_xi') {
+    const team = data.team || {};
+    return {
+      type,
+      title: String(team.name || 'Team Squad'),
+      subtitle: String(data.subtitle || (type === 'playing_xi' ? 'Playing XI' : 'Squad')).trim(),
+      summary: fallbackSummary,
+      team,
+      captain: String(data.captain || team.captain || '').trim(),
+      coach: String(data.coach || team.coach || '').trim(),
+      stats: data.stats || {},
+      players: Array.isArray(data.players) ? data.players : [],
+      total_players: Number(data.total_players || 0)
+    };
+  }
   if (type === 'match_summary') {
     const match = slimMatch(data.match || {});
     return {
@@ -2525,6 +2692,17 @@ async function buildStructuredContext(route, question) {
       route: effectiveRoute
     };
   }
+  if (effectiveRoute.action === 'team_squad' || effectiveRoute.action === 'playing_xi') {
+    const result = await runTeamSquad(effectiveRoute, question, {
+      playingXi: effectiveRoute.action === 'playing_xi'
+    });
+    return {
+      cache_ready: true,
+      available: Boolean(Array.isArray(result?.data?.players) && result.data.players.length),
+      result,
+      route: effectiveRoute
+    };
+  }
   if (effectiveRoute.action === 'record_lookup') {
     const result = await runRecordLookup(effectiveRoute, question);
     return {
@@ -2748,6 +2926,8 @@ function mergeResolvedPlayerMeta(player = {}, profile = {}, query = '') {
     name: canonicalName,
     image_url: String(profile.image_url || player.image_url || ''),
     wikipedia_url: String(profile.wikipedia_url || player.wikipedia_url || ''),
+    short_description: String(profile.short_description || player.short_description || ''),
+    description: String(profile.description || player.description || ''),
     country: String(profile.country || player.country || '')
   };
 }
@@ -2771,6 +2951,19 @@ async function enrichStructuredResult(structuredContext = {}, route = {}, questi
       originalName,
       data.player.name
     );
+  }
+
+  if ((type === 'team_stats' || type === 'team_info') && data.team?.name) {
+    const wikiSummary = await fetchWikipediaSummary(String(data.team.name || '').trim());
+    if (wikiSummary) {
+      data.team = {
+        ...data.team,
+        image_url: String(data.team.image_url || wikiSummary.image || '').trim(),
+        wikipedia_url: String(data.team.wikipedia_url || wikiSummary.wikipedia_url || '').trim(),
+        short_description: String(data.team.short_description || wikiSummary.description || '').trim(),
+        description: String(data.team.description || wikiSummary.extract || wikiSummary.description || '').trim()
+      };
+    }
   }
 
   if (type === 'compare_players' && data.left?.name && data.right?.name) {

@@ -1,11 +1,11 @@
 # Cricket Chat Bot Backend
 
-Express backend for the Cricket Chat Bot application. It serves the frontend, loads a local cricket archive into memory, answers structured cricket questions, enriches player results, and optionally blends live CricAPI data with an LLM-driven query router.
+Express backend for the Cricket Chat Bot application. It serves the frontend, answers structured cricket questions from the local Chroma vector archive, enriches player and team results with Wikipedia metadata, and optionally blends live CricAPI data with an LLM-driven query router.
 
 ## What This Service Does
 
 - Serves the static frontend from `../frontend`
-- Loads and indexes the local cricket archive on startup
+- Loads player, team, and match summaries from the local Chroma vector archive
 - Exposes archive search endpoints for players, teams, matches, and summaries
 - Accepts natural-language cricket questions through `/api/query`
 - Streams query progress and results through Server-Sent Events
@@ -15,14 +15,12 @@ Express backend for the Cricket Chat Bot application. It serves the frontend, lo
 ## Key Files
 
 - `server.js`: Express app, route registration, static hosting, and startup
-- `datasetStore.js`: archive loading, indexing, readiness tracking, and core local queries
 - `queryService.js`: natural-language orchestration and response shaping
 - `llamaRouter.js`: intent routing and action selection
 - `llamaClient.js`: local OpenAI-compatible endpoint and OpenAI fallback client
-- `statsService.js`: deterministic cricket stats actions
 - `cricApiService.js`: live CricAPI integration, normalization, and caching
 - `playerProfileService.js`: player enrichment and profile lookup
-- `entityResolver.js`: fuzzy player and team resolution
+- `vectorIndexService.js`: Chroma-backed player, team, and match indexing helpers
 - `scripts/`: dataset rebuild, vector build, and verification scripts
 
 ## Requirements
