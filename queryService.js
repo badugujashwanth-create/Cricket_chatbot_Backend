@@ -1,20 +1,34 @@
-const { routeQuestion, extractJsonFromText } = require('./llamaRouter');
-const { callLlama } = require('./llamaClient');
+const {
+  routeQuestion,
+  extractJsonFromText,
+  normalizeDataSources,
+  inferDataSources
+} = require('./llamaRouter');
+const { callLlama, openAiEndpointUrl } = require('./llamaClient');
 const { queryVectorDb } = require('./chromaService');
 const { getPlayerProfile } = require('./playerProfileService');
 const { getSession, setPendingClarification, clearPendingClarification, updateContext } = require('./sessionStore');
-const { NOT_AVAILABLE_MESSAGE, SUPPORTED_ACTIONS, GLOSSARY } = require('./constants');
+const { NOT_AVAILABLE_MESSAGE, SUPPORTED_ACTIONS, GLOSSARY, DATA_SOURCES } = require('./constants');
 const {
   CricApiConfigError,
+  CricbuzzApiConfigError,
   getLiveScores,
   searchPlayers: searchCricApiPlayers,
   getPlayerInfo,
   getMatchSchedule,
   getSeriesList,
-  getSeriesInfo
+  getSeriesInfo,
+  searchCricbuzzPlayers,
+  getCricbuzzPlayerCardByName
 } = require('./cricApiService');
+const { EspnServiceError, getPlayerCareerByQuery } = require('./espnService');
 const { normalizeText } = require('./textUtils');
-const { cleanEntitySegment, parseVsSides } = require('./queryParser');
+const {
+  cleanEntitySegment,
+  parseVsSides,
+  isLiveLeaningQuestion,
+  rankEntityCandidates
+} = require('./queryParser');
 const {
   loadPlayerProfiles,
   loadMatchSummaries,
@@ -26,6 +40,7 @@ const {
   findMatchesByTeams,
   findMatchesForTeam
 } = require('./vectorIndexService');
+const { lookupKnowledge } = require('./knowledgeService');
 
 const YEAR_REGEX = /\b(19\d{2}|20\d{2})\b/;
 const MATCH_ID_REGEX = /\b(\d{5,})\b/;
@@ -111,6 +126,11 @@ const NUMBER_WORDS = new Map([
   ['nine', 9],
   ['ten', 10]
 ]);
+const GENERAL_CHAT_SYSTEM_PROMPT =
+  'You are an intelligent Cricket AI Assistant. The user has asked a general question or greeted you. Answer them conversationally and politely in a short sentence, and gently guide them back to asking about cricket stats or live scores.';
+const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || '').trim();
+const OPENAI_MODEL = String(process.env.OPENAI_MODEL || 'gpt-4o').trim();
+const DATA_SOURCE = DATA_SOURCES;
 
 function pickFirst(...values) {
   for (const value of values) {
@@ -121,8 +141,172 @@ function pickFirst(...values) {
   return '';
 }
 
+function createEmptyVectorContext(warning = '') {
+  return {
+    available: false,
+    warning: String(warning || '').trim(),
+    results: []
+  };
+}
+
+function createEmptyCricApiContext(errors = []) {
+  return {
+    provider: 'cricapi',
+    available: false,
+    errors: uniqueNonEmpty(errors),
+    player_searches: [],
+    player_profiles: [],
+    live_scores: [],
+    archive_recent_matches: [],
+    schedule: [],
+    series: [],
+    series_info: null
+  };
+}
+
+function createEmptyCricbuzzContext(errors = []) {
+  return {
+    provider: 'cricbuzz',
+    available: false,
+    errors: uniqueNonEmpty(errors),
+    player_searches: [],
+    players: []
+  };
+}
+
+function createEmptyEspnContext(errors = []) {
+  return {
+    provider: 'espn',
+    available: false,
+    errors: uniqueNonEmpty(errors),
+    player_searches: [],
+    player: null
+  };
+}
+
+function resolveRequestedDataSources(route = {}, question = '') {
+  const action = String(route?.action || '').trim();
+  if (action === 'live_update') {
+    return [DATA_SOURCE.CRICAPI_LIVE];
+  }
+  if (action === 'general_knowledge') {
+    return [DATA_SOURCE.LOCAL_KNOWLEDGE];
+  }
+  if (isGeneralConversationAction(action)) {
+    return [DATA_SOURCE.OPENAI_FALLBACK];
+  }
+  const explicitSources = normalizeDataSources(route.data_sources || []);
+  const inferredSources = explicitSources.length ? explicitSources : inferDataSources(question, route);
+  return normalizeDataSources(inferredSources);
+}
+
 function uniqueNonEmpty(values = []) {
   return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))];
+}
+
+function isGeneralConversationAction(action = '') {
+  return ['chit_chat'].includes(String(action || '').trim());
+}
+
+async function callOpenAiChatCompletions(messages = [], { temperature = 0.2, timeoutMs = 60000 } = {}) {
+  if (!OPENAI_API_KEY) {
+    throw new Error('OpenAI API key is not configured.');
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Number(timeoutMs || 60000));
+
+  try {
+    const response = await fetch(openAiEndpointUrl(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${OPENAI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        temperature: Number.isFinite(Number(temperature)) ? Number(temperature) : 0.2,
+        messages
+      }),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      const payload = await response.text().catch(() => '');
+      throw new Error(`OpenAI chat completions failed (${response.status})${payload ? `: ${payload}` : ''}`);
+    }
+
+    const payload = await response.json();
+    return String(payload?.choices?.[0]?.message?.content || '').trim();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function normalizeDetectedEntities(values = []) {
+  return uniqueNonEmpty(Array.isArray(values) ? values : []).slice(0, 12);
+}
+
+function extractProperNamePhrases(text = '') {
+  const matches =
+    String(text || '').match(/\b(?:[A-Z][a-z]+|[A-Z]{2,4})(?:\s+(?:[A-Z][a-z]+|[A-Z]{2,4})){1,4}\b/g) || [];
+  const blocked = new Set([
+    'Cricket Intelligence',
+    'Match Summary',
+    'Recent Match',
+    'Next Match',
+    'Upcoming Matches'
+  ]);
+  return uniqueNonEmpty(matches.filter((value) => !blocked.has(String(value || '').trim())));
+}
+
+function extractDetectedEntitiesFallback(route = {}, data = {}, answer = '', cricApiContext = {}) {
+  const baseCandidates = [
+    route.player,
+    route.player1,
+    route.player2,
+    route.team,
+    route.team1,
+    route.team2,
+    data?.player?.name,
+    data?.team?.name,
+    data?.left?.name,
+    data?.right?.name,
+    data?.match?.name,
+    data?.match?.venue
+  ];
+
+  const contextualCandidates = [];
+  const matchTeams = Array.isArray(data?.match?.teams) ? data.match.teams : [];
+  const recentMatches = Array.isArray(data?.recent_matches) ? data.recent_matches : [];
+  const liveMatches = Array.isArray(cricApiContext?.live_scores) ? cricApiContext.live_scores : [];
+
+  for (const team of matchTeams) contextualCandidates.push(team);
+  for (const match of recentMatches.slice(0, 5)) {
+    contextualCandidates.push(match?.name, match?.venue);
+    if (Array.isArray(match?.teams)) contextualCandidates.push(...match.teams);
+  }
+  for (const match of liveMatches.slice(0, 3)) {
+    contextualCandidates.push(match?.name, match?.venue);
+    if (Array.isArray(match?.teams)) contextualCandidates.push(...match.teams);
+  }
+
+  const normalizedAnswer = String(answer || '').trim();
+  const matchedAnswerEntities = [];
+  if (normalizedAnswer) {
+    for (const value of [...baseCandidates, ...contextualCandidates]) {
+      const clean = String(value || '').trim();
+      if (clean && normalizedAnswer.includes(clean)) {
+        matchedAnswerEntities.push(clean);
+      }
+    }
+  }
+
+  return normalizeDetectedEntities([
+    ...baseCandidates,
+    ...matchedAnswerEntities,
+    ...extractProperNamePhrases(normalizedAnswer)
+  ]);
 }
 
 function wordToNumber(value = '') {
@@ -420,6 +604,7 @@ function toUnifiedResponseType(details = {}) {
   if (rawType === 'team_stats' || rawType === 'team_info') return 'team';
   if (rawType === 'match_summary' || rawType === 'live_update') return 'match';
   if (rawType === 'compare_players' || rawType === 'head_to_head') return 'comparison';
+  if (rawType === 'general_knowledge' || rawType === 'glossary') return 'record';
   if (rawType === 'record_lookup') return 'record';
   if (rawType === 'subjective_analysis') {
     return details.left || details.right || details.team1 || details.team2 ? 'comparison' : 'record';
@@ -509,9 +694,16 @@ function buildUnifiedExtra(details = {}, summary = '', answer = '', suggestions 
   const rawType = String(details.type || '').trim();
   const extra = {
     action: rawType || 'summary',
+    intent: String(details.intent || rawType || '').trim(),
+    sub_intent: String(details.sub_intent || '').trim(),
+    answer_mode: String(details.answer_mode || '').trim(),
+    time_context: String(details.time_context || '').trim(),
+    confidence: Number.isFinite(Number(details.confidence)) ? Number(details.confidence) : undefined,
     subtitle: String(details.subtitle || '').trim(),
     suggestions,
-    insights
+    insights,
+    detected_entities: normalizeDetectedEntities(details.detected_entities),
+    sources: Array.isArray(details.sources) ? details.sources : []
   };
 
   if (rawType === 'chat') {
@@ -531,6 +723,7 @@ function buildUnifiedExtra(details = {}, summary = '', answer = '', suggestions 
     };
     extra.player_description = String(details.player?.description || '').trim();
     extra.recent_matches = Array.isArray(details.recent_matches) ? details.recent_matches : [];
+    extra.chartData = details.chartData && typeof details.chartData === 'object' ? details.chartData : null;
     return pruneEmptyFields(extra);
   }
 
@@ -568,6 +761,7 @@ function buildUnifiedExtra(details = {}, summary = '', answer = '', suggestions 
       left: details.left || {},
       right: details.right || {}
     };
+    extra.chartData = details.chartData && typeof details.chartData === 'object' ? details.chartData : null;
     return pruneEmptyFields(extra);
   }
 
@@ -599,6 +793,7 @@ function buildUnifiedExtra(details = {}, summary = '', answer = '', suggestions 
     extra.metric = String(details.metric || '').trim();
     extra.resolved_metric = String(details.resolved_metric || '').trim();
     extra.rows = Array.isArray(details.rows) ? details.rows : [];
+    extra.chartData = details.chartData && typeof details.chartData === 'object' ? details.chartData : null;
     return pruneEmptyFields(extra);
   }
 
@@ -613,6 +808,16 @@ function buildUnifiedExtra(details = {}, summary = '', answer = '', suggestions 
   if (rawType === 'glossary') {
     extra.term = String(details.term || '').trim();
     extra.explanation = String(details.explanation || '').trim();
+    return pruneEmptyFields(extra);
+  }
+
+  if (rawType === 'general_knowledge') {
+    extra.mode = 'knowledge';
+    extra.question = String(details.question || '').trim();
+    extra.category = String(details.category || '').trim();
+    extra.related_topics = Array.isArray(details.related_topics) ? details.related_topics : [];
+    extra.examples = Array.isArray(details.examples) ? details.examples : [];
+    extra.fallback_used = Boolean(details.fallback_used);
     return pruneEmptyFields(extra);
   }
 
@@ -936,8 +1141,10 @@ function lookupKnownRecord(question = '') {
   const normalizedQuestion = normalizeText(question);
 
   if (
-    (/\bhighest score\b/.test(normalizedQuestion) && /\bodi\b|\bone day international\b/.test(normalizedQuestion)) ||
-    /\bhighest score in odi\b/.test(normalizedQuestion)
+    ((/\bhighest score\b/.test(normalizedQuestion) || /\bhighest individual score\b/.test(normalizedQuestion)) &&
+      /\bodi\b|\bone day international\b/.test(normalizedQuestion)) ||
+    /\bhighest score in odi\b/.test(normalizedQuestion) ||
+    /\bhighest individual score in odi\b/.test(normalizedQuestion)
   ) {
     return {
       title: 'Highest ODI Score',
@@ -953,6 +1160,48 @@ function lookupKnownRecord(question = '') {
         date: '2014-11-13'
       },
       player_name: 'Rohit Sharma'
+    };
+  }
+
+  if (
+    (/\bfastest century\b|\bfastest 100\b/.test(normalizedQuestion) &&
+      /\bodi\b|\bone day international\b/.test(normalizedQuestion)) ||
+    /\bfastest century in odi\b/.test(normalizedQuestion)
+  ) {
+    return {
+      title: 'Fastest ODI Century',
+      metric: 'fastest_century',
+      resolved_metric: 'exact_record',
+      answer:
+        'AB de Villiers holds the men\'s ODI fastest-century record with a hundred in 31 balls against West Indies in Johannesburg on 18 January 2015.',
+      stats: {
+        player: 'AB de Villiers',
+        balls: 31,
+        opposition: 'West Indies',
+        date: '2015-01-18'
+      },
+      player_name: 'AB de Villiers'
+    };
+  }
+
+  if (
+    /\bbest bowling figures\b/.test(normalizedQuestion) &&
+    /\bodi\b|\bone day international\b/.test(normalizedQuestion)
+  ) {
+    return {
+      title: 'Best ODI Bowling Figures',
+      metric: 'best_bowling_figures',
+      resolved_metric: 'exact_record',
+      answer:
+        'Chaminda Vaas holds the men\'s ODI best-bowling record with 8 for 19 against Zimbabwe in Colombo in December 2001.',
+      stats: {
+        player: 'Chaminda Vaas',
+        wickets: 8,
+        runs_conceded: 19,
+        opposition: 'Zimbabwe',
+        year: 2001
+      },
+      player_name: 'Chaminda Vaas'
     };
   }
 
@@ -1025,7 +1274,7 @@ function resolutionWeight(status = '') {
   return 0;
 }
 
-async function resolveEntityWithFallback(entityType, candidates = []) {
+async function resolveEntityWithFallback(entityType, candidates = [], { question = '' } = {}) {
   const queries = buildEntityCandidates(...candidates);
   let best = {
     query: queries[0] || '',
@@ -1033,7 +1282,7 @@ async function resolveEntityWithFallback(entityType, candidates = []) {
   };
 
   for (const query of queries) {
-    const resolution = await resolveEntityStrict(entityType, query);
+    const resolution = await resolveEntityStrict(entityType, query, { question });
     if (resolution.status === 'resolved') {
       const currentScore = Number(resolution.score || 0);
       const bestScore = Number(best.resolution?.score || 0);
@@ -1072,13 +1321,15 @@ function buildResponse(result = {}) {
   const image = buildUnifiedImage(details);
   const stats = buildUnifiedStats(details);
   const extra = buildUnifiedExtra(details, summary, answer, suggestions);
+  const detectedEntities = normalizeDetectedEntities(extra.detected_entities);
   return {
     type,
     title,
     image,
     summary,
     stats,
-    extra
+    extra,
+    detected_entities: detectedEntities
   };
 }
 
@@ -1205,6 +1456,9 @@ function applySessionRouteFallback(route = {}, question = '', session = null) {
     return {
       ...route,
       action: 'player_stats',
+      intent: 'player_stats',
+      sub_intent: 'player_stats',
+      answer_mode: 'fact',
       player: playerName,
       team: '',
       term: '',
@@ -1216,6 +1470,9 @@ function applySessionRouteFallback(route = {}, question = '', session = null) {
     return {
       ...route,
       action: 'team_stats',
+      intent: 'team_stats',
+      sub_intent: 'team_stats',
+      answer_mode: 'fact',
       team: teamName,
       player: '',
       term: '',
@@ -1232,7 +1489,9 @@ function emitStatus(onStatus, payload) {
 }
 
 function actionStatusMessage(action = '') {
-  if (action === 'chit_chat') return 'Responding...';
+  if (isGeneralConversationAction(action)) return 'Responding conversationally.';
+  if (action === 'general_knowledge') return 'Checking the local cricket knowledge base.';
+  if (action === 'live_update') return 'Checking live scores.';
   if (action === 'subjective_analysis') return 'Analyzing the debate.';
   if (action === 'player_stats' || action === 'player_season_stats') {
     return 'Searching player stats.';
@@ -1254,6 +1513,13 @@ function normalizeRoute(route = {}) {
   const entities = route?.entities && typeof route.entities === 'object' ? route.entities : {};
   const merged = { ...entities, ...route };
   const action = SUPPORTED_ACTIONS.includes(merged.action) ? merged.action : 'not_supported';
+  const dataSources = normalizeDataSources(
+    merged.data_sources ||
+      merged.dataSources ||
+      merged.required_data_sources ||
+      merged.requiredDataSources ||
+      []
+  );
   return {
     action,
     player: cleanEntitySegment(pickFirst(merged.player, merged.query)),
@@ -1270,7 +1536,13 @@ function normalizeRoute(route = {}) {
     term: pickFirst(merged.term),
     limit: pickFirst(merged.limit),
     min_balls: pickFirst(merged.min_balls),
-    min_overs: pickFirst(merged.min_overs)
+    min_overs: pickFirst(merged.min_overs),
+    intent: pickFirst(merged.intent, merged.action),
+    sub_intent: pickFirst(merged.sub_intent, merged.subIntent),
+    time_context: pickFirst(merged.time_context, merged.timeContext),
+    answer_mode: pickFirst(merged.answer_mode, merged.answerMode),
+    confidence: Number.isFinite(Number(merged.confidence)) ? Number(merged.confidence) : null,
+    data_sources: dataSources
   };
 }
 
@@ -1345,7 +1617,28 @@ function buildResolutionChoices(entityType, matches = []) {
   );
 }
 
-async function resolveEntityStrict(entityType, query = '') {
+async function fetchLivePlayerCandidates(query = '') {
+  try {
+    const result = await searchCricApiPlayers({ q: query, limit: 5 });
+    return Array.isArray(result?.items)
+      ? result.items
+          .map((item) => ({
+            id: String(item.id || '').trim(),
+            name: String(item.name || '').trim(),
+            canonical_name: String(item.name || '').trim(),
+            team: String(item.country || item.team || '').trim(),
+            role: '',
+            source: 'cricapi',
+            is_active: true
+          }))
+          .filter((item) => item.id && item.name)
+      : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+async function resolveEntityStrict(entityType, query = '', { question = '' } = {}) {
   const cleanQuery = String(query || '').trim();
   if (!cleanQuery) return { status: 'missing' };
 
@@ -1355,7 +1648,63 @@ async function resolveEntityStrict(entityType, query = '') {
       : await resolveVectorPlayer(cleanQuery);
 
   const matches = Array.isArray(rawResolution?.matches) ? rawResolution.matches : [];
-  if (rawResolution?.item) {
+  const liveLeaning = entityType === 'player' && isLiveLeaningQuestion(question);
+
+  if (entityType === 'player' && liveLeaning) {
+    const liveCandidates = await fetchLivePlayerCandidates(cleanQuery);
+    const rankedArchiveMatches = rankEntityCandidates(
+      cleanQuery,
+      matches.map((item) => ({
+        ...normalizeResolvedEntity(entityType, item),
+        source: 'vector'
+      })),
+      {
+        liveLeaning: true,
+        liveAliases: liveCandidates.map((item) => item.name)
+      }
+    );
+
+    if (rankedArchiveMatches.length) {
+      const topScore = Number(
+        rankedArchiveMatches[0]?.weighted_score || rankedArchiveMatches[0]?.score || 0
+      );
+      const secondScore = Number(
+        rankedArchiveMatches[1]?.weighted_score || rankedArchiveMatches[1]?.score || 0
+      );
+      const choices = buildResolutionChoices(entityType, rankedArchiveMatches);
+
+      if (topScore < 0.72 || secondScore >= topScore - 0.08) {
+        return {
+          status: 'clarify',
+          query: cleanQuery,
+          choices,
+          score: topScore
+        };
+      }
+
+      return {
+        status: 'resolved',
+        item: normalizeResolvedEntity(entityType, rankedArchiveMatches[0]),
+        choices,
+        score: topScore
+      };
+    }
+
+    const rankedLiveMatches = rankEntityCandidates(cleanQuery, liveCandidates, {
+      liveLeaning: true,
+      liveAliases: liveCandidates.map((item) => item.name)
+    });
+    if (rankedLiveMatches.length && Number(rankedLiveMatches[0]?.weighted_score || 0) >= 0.7) {
+      return {
+        status: 'resolved',
+        item: normalizeResolvedEntity(entityType, rankedLiveMatches[0]),
+        choices: buildResolutionChoices(entityType, rankedLiveMatches),
+        score: Number(rankedLiveMatches[0].weighted_score || 0)
+      };
+    }
+  }
+
+  if (rawResolution?.found && rawResolution?.item) {
     return {
       status: 'resolved',
       item: normalizeResolvedEntity(entityType, rawResolution.item),
@@ -1364,11 +1713,26 @@ async function resolveEntityStrict(entityType, query = '') {
     };
   }
   if (matches.length) {
+    const topScore = Number(matches[0]?.score || 0);
+    const secondScore = Number(matches[1]?.score || 0);
+    const choices = buildResolutionChoices(entityType, matches);
+
+    // Avoid silently collapsing vague queries onto a famous player or team.
+    // If the top fuzzy match is weak or close to the runner-up, force clarification instead.
+    if (topScore < 0.72 || secondScore >= topScore - 0.08) {
+      return {
+        status: 'clarify',
+        query: cleanQuery,
+        choices,
+        score: topScore
+      };
+    }
+
     return {
       status: 'resolved',
       item: normalizeResolvedEntity(entityType, matches[0]),
-      choices: buildResolutionChoices(entityType, matches),
-      score: Number(matches[0]?.score || 0)
+      choices,
+      score: topScore
     };
   }
 
@@ -1403,6 +1767,95 @@ function toTeamStats(team = {}) {
     win_rate: Number(team.win_rate || 0),
     average_score: matches > 0 ? Number((runs / matches).toFixed(2)) : 0,
     runs
+  };
+}
+
+function hasMeaningfulStats(stats = {}) {
+  if (!stats || typeof stats !== 'object') return false;
+  return ['matches', 'runs', 'average', 'strike_rate', 'wickets', 'economy', 'fours', 'sixes'].some(
+    (key) => Number(stats[key] || 0) > 0
+  );
+}
+
+function mergeEspnCareerIntoPlayer(player = {}, espnPlayer = null) {
+  if (!espnPlayer || typeof espnPlayer !== 'object') return player;
+  const careerSummary =
+    espnPlayer.career_summary && typeof espnPlayer.career_summary === 'object'
+      ? espnPlayer.career_summary
+      : {};
+  const fallbackStats = hasMeaningfulStats(player.stats || {}) ? player.stats || {} : careerSummary;
+
+  return {
+    ...player,
+    id: String(player.id || espnPlayer.id || '').trim(),
+    player_key: String(player.player_key || player.id || espnPlayer.id || '').trim(),
+    name: String(player.name || espnPlayer.name || '').trim(),
+    full_name: String(player.full_name || espnPlayer.full_name || player.name || espnPlayer.name || '').trim(),
+    team: String(player.team || espnPlayer.team || '').trim(),
+    team_name: String(player.team_name || player.team || espnPlayer.team || '').trim(),
+    role: String(player.role || espnPlayer.role || '').trim(),
+    batting_style: String(player.batting_style || espnPlayer.batting_style || '').trim(),
+    bowling_style: String(player.bowling_style || espnPlayer.bowling_style || '').trim(),
+    major_teams: Array.isArray(espnPlayer.major_teams) ? espnPlayer.major_teams : [],
+    source: String(player.source || espnPlayer.source || '').trim(),
+    stats: fallbackStats,
+    career: {
+      summary: careerSummary,
+      by_format:
+        espnPlayer.stats_by_format && typeof espnPlayer.stats_by_format === 'object'
+          ? espnPlayer.stats_by_format
+          : {}
+    }
+  };
+}
+
+function buildComparisonChartData(left = {}, right = {}) {
+  return {
+    type: 'radar',
+    title: 'Player Skill Comparison',
+    labels: ['Matches', 'Runs', 'Average', 'Strike Rate', 'Wickets', 'Sixes'],
+    datasets: [
+      {
+        label: String(left.name || 'Player A'),
+        color: '#22c55e',
+        data: [
+          Number(left.stats?.matches || 0),
+          Number(left.stats?.runs || 0),
+          Number(left.stats?.average || 0),
+          Number(left.stats?.strike_rate || 0),
+          Number(left.stats?.wickets || 0),
+          Number(left.stats?.sixes || 0)
+        ]
+      },
+      {
+        label: String(right.name || 'Player B'),
+        color: '#38bdf8',
+        data: [
+          Number(right.stats?.matches || 0),
+          Number(right.stats?.runs || 0),
+          Number(right.stats?.average || 0),
+          Number(right.stats?.strike_rate || 0),
+          Number(right.stats?.wickets || 0),
+          Number(right.stats?.sixes || 0)
+        ]
+      }
+    ]
+  };
+}
+
+function buildLeaderboardChartData(metric = '', rows = []) {
+  const chartRows = Array.isArray(rows) ? rows.slice(0, 8) : [];
+  return {
+    type: 'bar',
+    title: `Top ${titleCaseMetric(metric || 'performers')}`,
+    labels: chartRows.map((row) => String(row.player || row.team || 'Record')),
+    datasets: [
+      {
+        label: titleCaseMetric(metric || 'value'),
+        color: '#f59e0b',
+        data: chartRows.map((row) => Number(row.value || 0))
+      }
+    ]
   };
 }
 
@@ -1512,11 +1965,11 @@ function resolveLeaderboardMetric(routeMetric = '', question = '') {
 }
 
 async function runPlayerAction(action, route, question) {
-  const { query: playerQuery, resolution } = await resolveEntityWithFallback('player', [
-    route.player,
-    removeGenericWords(question),
-    question
-  ]);
+  const { query: playerQuery, resolution } = await resolveEntityWithFallback(
+    'player',
+    [route.player, removeGenericWords(question), question],
+    { question }
+  );
   if (resolution.status !== 'resolved') {
     return unresolvedEntityResult('player', playerQuery, resolution);
   }
@@ -1530,7 +1983,9 @@ async function runPlayerAction(action, route, question) {
 
   return {
     answer: uniqueNonEmpty([
-      `${player.name} has ${formatStatValue(stats.runs)} runs from ${formatStatValue(stats.matches)} archived matches, with an average of ${formatStatValue(stats.average)} and strike rate ${formatStatValue(stats.strike_rate)}.`,
+      hasMeaningfulStats(stats)
+        ? `${player.name} has ${formatStatValue(stats.runs)} runs from ${formatStatValue(stats.matches)} archived matches, with an average of ${formatStatValue(stats.average)} and strike rate ${formatStatValue(stats.strike_rate)}.`
+        : `${player.name} was resolved as the active player match, but detailed archive totals are currently limited. Live and fallback profile sources will be used to enrich the response.`,
       stats.wickets ? `${player.name} has also taken ${formatStatValue(stats.wickets)} wickets.` : '',
       scopeNote
     ]).join(' '),
@@ -1540,11 +1995,15 @@ async function runPlayerAction(action, route, question) {
       subtitle: [player.team, format, season].filter(Boolean).join(' | '),
       player: {
         id: player.id,
+        player_key: player.id,
         name: player.name,
+        full_name: player.canonical_name || player.name,
         canonical_name: player.canonical_name || player.name,
         dataset_name: player.dataset_name || player.name,
         team: player.team,
-        role: player.role
+        team_name: player.team,
+        role: player.role,
+        source: String(player.source || 'vector').trim() || 'vector'
       },
       stats,
       recent_matches: []
@@ -1651,8 +2110,8 @@ async function runMatchSummary(route, question) {
 
 async function runComparePlayers(route, question) {
   const vs = parseVsSides(question) || {};
-  const leftLookup = await resolveEntityWithFallback('player', [route.player1, vs.left]);
-  const rightLookup = await resolveEntityWithFallback('player', [route.player2, vs.right]);
+  const leftLookup = await resolveEntityWithFallback('player', [route.player1, vs.left], { question });
+  const rightLookup = await resolveEntityWithFallback('player', [route.player2, vs.right], { question });
   if (leftLookup.resolution.status !== 'resolved') {
     return unresolvedEntityResult('player', leftLookup.query, leftLookup.resolution);
   }
@@ -1677,7 +2136,9 @@ async function runComparePlayers(route, question) {
       type: 'compare_players',
       left: {
         id: left.id,
+        player_key: left.id,
         name: left.name,
+        full_name: left.canonical_name || left.name,
         canonical_name: left.canonical_name || left.name,
         team: left.team,
         role: left.role,
@@ -1685,12 +2146,18 @@ async function runComparePlayers(route, question) {
       },
       right: {
         id: right.id,
+        player_key: right.id,
         name: right.name,
+        full_name: right.canonical_name || right.name,
         canonical_name: right.canonical_name || right.name,
         team: right.team,
         role: right.role,
         stats: rightStats
-      }
+      },
+      chartData: buildComparisonChartData(
+        { name: left.name, stats: leftStats },
+        { name: right.name, stats: rightStats }
+      )
     },
     followups: ['Show recent live scores', 'Show team head to head', 'Show top batters']
   };
@@ -1786,7 +2253,8 @@ async function runTopPlayers(route, question) {
       type: 'top_players',
       metric: metricInfo.requested_metric,
       resolved_metric: metricInfo.resolved_metric,
-      rows
+      rows,
+      chartData: buildLeaderboardChartData(metricInfo.requested_metric, rows)
     },
     followups: ['Compare two players', 'Show player stats', 'Show live scores']
   };
@@ -1810,6 +2278,62 @@ async function runGlossary(route, question) {
       explanation
     },
     followups: ['Show top batters', 'Show player stats', 'Show live scores']
+  };
+}
+
+async function runGeneralKnowledge(route, question) {
+  const knowledge = lookupKnowledge(question, {
+    subIntent: route.sub_intent || ''
+  });
+  const fallbackSubIntent = String(route.sub_intent || '').trim();
+  const fallbackMessages = {
+    points_table:
+      'The current setup does not expose a live points table feed yet. I can still help with live scores, schedules, and recent results.',
+    team_ranking:
+      'Live ICC rankings are not available from the configured providers right now. I can still explain how rankings work or help with team stats.',
+    pitch_report:
+      'Live venue-specific pitch reports are not available from the configured providers right now. I can still explain common pitch behaviors and matchups.',
+    injury_update:
+      'Verified live injury updates are not available from the configured providers right now. I can still help with squad, playing XI, and recent match context.',
+    general_cricket_fallback:
+      'I can explain cricket rules, formats, history, records, equipment, and training basics.'
+  };
+
+  if (!knowledge.found) {
+    const fallbackAnswer =
+      fallbackMessages[fallbackSubIntent] ||
+      'I do not have a verified local knowledge entry for that exact cricket topic yet, but I can help with rules, history, records, and training basics.';
+
+    return {
+      answer: fallbackAnswer,
+      data: {
+        type: 'general_knowledge',
+        title: 'Cricket Knowledge',
+        category: fallbackSubIntent || 'general_cricket_fallback',
+        question: String(question || '').trim(),
+        source_label: 'Local Knowledge',
+        fallback_used: true
+      },
+      followups: ['What is LBW?', 'Who won WC 2011?', 'Difference between ODI and T20']
+    };
+  }
+
+  const entry = knowledge.entry;
+  return {
+    answer: entry.answer,
+    data: {
+      type: 'general_knowledge',
+      title: entry.title,
+      category: entry.sub_intent || entry.category || 'general_cricket_fallback',
+      question: String(question || '').trim(),
+      source_label: 'Local Knowledge',
+      related_topics: Array.isArray(entry.related_topics) ? entry.related_topics : [],
+      examples: Array.isArray(entry.examples) ? entry.examples : [],
+      confidence: Number(knowledge.score || 0)
+    },
+    followups: Array.isArray(entry.related_topics) && entry.related_topics.length
+      ? entry.related_topics.slice(0, 3)
+      : ['Show live scores', 'Show player stats', 'Show cricket records']
   };
 }
 
@@ -1995,8 +2519,8 @@ async function refineRouteForQuestion(route = {}, question = '') {
 
   if (vs?.left && vs?.right) {
     const [leftPlayer, rightPlayer, leftTeam, rightTeam] = await Promise.all([
-      resolveEntityWithFallback('player', [route.player1, route.player, vs.left]),
-      resolveEntityWithFallback('player', [route.player2, route.player, vs.right]),
+      resolveEntityWithFallback('player', [route.player1, route.player, vs.left], { question }),
+      resolveEntityWithFallback('player', [route.player2, route.player, vs.right], { question }),
       resolveEntityWithFallback('team', [route.team1, route.team, vs.left]),
       resolveEntityWithFallback('team', [route.team2, route.team, vs.right])
     ]);
@@ -2046,7 +2570,7 @@ async function refineRouteForQuestion(route = {}, question = '') {
 
   if ((route.action === 'player_stats' || route.action === 'player_season_stats') && !vs) {
     const [playerLookup, teamLookup] = await Promise.all([
-      resolveEntityWithFallback('player', [route.player, removeGenericWords(question), question]),
+      resolveEntityWithFallback('player', [route.player, removeGenericWords(question), question], { question }),
       resolveEntityWithFallback('team', [route.team, removeGenericWords(question), question])
     ]);
     if (isResolved(teamLookup.resolution) && !isResolved(playerLookup.resolution)) {
@@ -2158,6 +2682,257 @@ function compactCricApiContext(context = {}) {
         }
       : null
   };
+}
+
+function compactCricbuzzPlayerForData(player = {}) {
+  return {
+    id: String(player.id || '').trim(),
+    name: String(player.name || '').trim(),
+    team: String(player.team || '').trim(),
+    country: String(player.country || '').trim(),
+    role: String(player.role || '').trim(),
+    batting_style: String(player.batting_style || '').trim(),
+    bowling_style: String(player.bowling_style || '').trim(),
+    bio: String(player.bio || '').trim(),
+    stats: player.stats && typeof player.stats === 'object' ? player.stats : {}
+  };
+}
+
+function compactCricbuzzContext(context = {}) {
+  return {
+    provider: 'cricbuzz',
+    available: Boolean(context.available),
+    errors: Array.isArray(context.errors) ? context.errors.slice(0, 3) : [],
+    player_searches: Array.isArray(context.player_searches)
+      ? context.player_searches.slice(0, 2).map((item) => ({
+          query: item.query,
+          items: Array.isArray(item.items) ? item.items.slice(0, 3).map(compactCricbuzzPlayerForData) : []
+        }))
+      : [],
+    players: Array.isArray(context.players)
+      ? context.players.slice(0, 2).map(compactCricbuzzPlayerForData)
+      : []
+  };
+}
+
+function compactEspnContext(context = {}) {
+  return {
+    provider: 'espn',
+    available: Boolean(context.available),
+    errors: Array.isArray(context.errors) ? context.errors.slice(0, 3) : [],
+    player_searches: Array.isArray(context.player_searches)
+      ? context.player_searches.slice(0, 2).map((item) => ({
+          query: item.query,
+          items: Array.isArray(item.items) ? item.items.slice(0, 3) : []
+        }))
+      : [],
+    player:
+      context.player && typeof context.player === 'object'
+        ? {
+            id: String(context.player.id || '').trim(),
+            name: String(context.player.name || '').trim(),
+            full_name: String(context.player.full_name || '').trim(),
+            team: String(context.player.team || '').trim(),
+            role: String(context.player.role || '').trim(),
+            batting_style: String(context.player.batting_style || '').trim(),
+            bowling_style: String(context.player.bowling_style || '').trim(),
+            career_summary:
+              context.player.career_summary && typeof context.player.career_summary === 'object'
+                ? context.player.career_summary
+                : {},
+            stats_by_format:
+              context.player.stats_by_format && typeof context.player.stats_by_format === 'object'
+                ? context.player.stats_by_format
+                : {}
+          }
+        : null
+  };
+}
+
+function buildMergedApiContext({
+  question = '',
+  route = {},
+  structuredContext = null,
+  vectorContext = {},
+  cricApiContext = {},
+  cricbuzzContext = {},
+  espnContext = {}
+} = {}) {
+  const requestedSources = resolveRequestedDataSources(route, question);
+  const merged = {
+    user_question: String(question || '').trim(),
+    route: {
+      action: String(route.action || 'not_supported').trim() || 'not_supported',
+      data_sources: requestedSources
+    },
+    source_status: {
+      vector_db: {
+        requested: requestedSources.includes(DATA_SOURCE.VECTOR_DB),
+        available: Boolean(vectorContext?.available)
+      },
+      local_knowledge: {
+        requested: requestedSources.includes(DATA_SOURCE.LOCAL_KNOWLEDGE),
+        available: String(structuredContext?.result?.data?.type || '').trim() === 'general_knowledge'
+      },
+      cricapi: {
+        requested: requestedSources.includes(DATA_SOURCE.CRICAPI_LIVE),
+        available: Boolean(cricApiContext?.available)
+      },
+      cricbuzz: {
+        requested: requestedSources.includes(DATA_SOURCE.CRICBUZZ_STATS),
+        available: Boolean(cricbuzzContext?.available)
+      },
+      espn: {
+        requested: ['player_stats', 'player_season_stats', 'compare_players'].includes(
+          String(route.action || '').trim()
+        ),
+        available: Boolean(espnContext?.available)
+      }
+    },
+    vector_db:
+      requestedSources.includes(DATA_SOURCE.VECTOR_DB) ||
+      Boolean(vectorContext?.available) ||
+      Boolean(Array.isArray(vectorContext?.results) && vectorContext.results.length)
+        ? compactVectorContext(vectorContext)
+        : null,
+    local_knowledge:
+      requestedSources.includes(DATA_SOURCE.LOCAL_KNOWLEDGE) &&
+      String(structuredContext?.result?.data?.type || '').trim() === 'general_knowledge'
+        ? {
+            available: true,
+            category: String(structuredContext?.result?.data?.category || '').trim(),
+            title: String(structuredContext?.result?.data?.title || '').trim(),
+            answer: String(structuredContext?.result?.answer || '').trim()
+          }
+        : null,
+    cricapi:
+      requestedSources.includes(DATA_SOURCE.CRICAPI_LIVE) || Boolean(cricApiContext?.available)
+        ? compactCricApiContext(cricApiContext)
+        : null,
+    cricbuzz:
+      requestedSources.includes(DATA_SOURCE.CRICBUZZ_STATS) || Boolean(cricbuzzContext?.available)
+        ? compactCricbuzzContext(cricbuzzContext)
+        : null,
+    espn:
+      ['player_stats', 'player_season_stats', 'compare_players'].includes(
+        String(route.action || '').trim()
+      ) || Boolean(espnContext?.available)
+        ? compactEspnContext(espnContext)
+        : null
+  };
+
+  if (structuredContext) {
+    const structuredSummary = compactStructuredResult(structuredContext);
+    if (structuredSummary.available || structuredSummary.data || structuredSummary.answer) {
+      merged.structured_context = structuredSummary;
+    }
+  }
+
+  return merged;
+}
+
+function buildMergedEvidenceContext({
+  question = '',
+  route = {},
+  vectorContext = {},
+  livePayload = null,
+  cricbuzzContext = {},
+  espnContext = {}
+} = {}) {
+  const requestedSources = resolveRequestedDataSources(route, question);
+  const sections = [
+    `Question: ${String(question || '').trim()}`,
+    `Primary Action: ${String(route.action || 'not_supported').trim() || 'not_supported'}`,
+    `Requested Data Sources: ${requestedSources.join(', ') || 'NONE'}`
+  ];
+
+  if (requestedSources.includes(DATA_SOURCE.OPENAI_FALLBACK)) {
+    sections.push(
+      [
+        'OPENAI_FALLBACK_STATUS:',
+        'This query needs general cricket reasoning or conversational synthesis. Answer directly from the supplied evidence, and if no specialist evidence is present, respond from broad cricket knowledge without inventing unavailable live statistics.'
+      ].join('\n')
+    );
+  }
+
+  if (requestedSources.includes(DATA_SOURCE.LOCAL_KNOWLEDGE)) {
+    sections.push(
+      [
+        'LOCAL_KNOWLEDGE_STATUS:',
+        'Use the deterministic local cricket knowledge layer for rules, terminology, history, world cup winners, equipment, and training topics. Do not invent live statistics when only local knowledge is available.'
+      ].join('\n')
+    );
+  }
+
+  if (requestedSources.includes(DATA_SOURCE.CRICAPI_LIVE)) {
+    if (livePayload) {
+      sections.push(`LIVE_API_JSON:\n${JSON.stringify(compactCricApiContext(livePayload), null, 2)}`);
+      if (!livePayload.available) {
+        sections.push(
+          [
+            'LIVE_API_STATUS:',
+            'Live data is currently unavailable. Answer any historical parts from VECTOR_DB only, and explicitly say the live portion could not be fetched right now.'
+          ].join('\n')
+        );
+      }
+    } else {
+      sections.push(
+        [
+          'LIVE_API_JSON:',
+          'null',
+          'LIVE_API_STATUS:',
+          'Live data is currently unavailable. Answer any historical parts from VECTOR_DB only, and explicitly say the live portion could not be fetched right now.'
+        ].join('\n')
+      );
+    }
+  }
+
+  if (requestedSources.includes(DATA_SOURCE.CRICBUZZ_STATS)) {
+    sections.push(
+      `CRICBUZZ_STATS_JSON:\n${JSON.stringify(compactCricbuzzContext(cricbuzzContext), null, 2)}`
+    );
+    if (!cricbuzzContext?.available) {
+      sections.push(
+        [
+          'CRICBUZZ_STATUS:',
+          'Granular Cricbuzz player statistics are currently unavailable. Use the remaining sources and state clearly when deep player stats could not be fetched.'
+        ].join('\n')
+      );
+    }
+  }
+
+  if (espnContext?.available || ['player_stats', 'player_season_stats', 'compare_players'].includes(String(route.action || '').trim())) {
+    sections.push(`ESPN_STATS_JSON:\n${JSON.stringify(compactEspnContext(espnContext), null, 2)}`);
+    if (!espnContext?.available) {
+      sections.push(
+        [
+          'ESPN_STATUS:',
+          'ESPN fallback career data is unavailable. Use the remaining evidence and say clearly when career enrichments could not be fetched.'
+        ].join('\n')
+      );
+    }
+  }
+
+  if (requestedSources.includes(DATA_SOURCE.VECTOR_DB)) {
+    const vectorChunks = Array.isArray(vectorContext.results)
+      ? vectorContext.results.slice(0, 5).map((row, index) =>
+          [
+            `Chunk ${index + 1}:`,
+            `Metadata: ${JSON.stringify(row.metadata && typeof row.metadata === 'object' ? row.metadata : {}, null, 2)}`,
+            `Text: ${String(row.document_preview || row.document || '').trim() || 'No preview available.'}`
+          ].join('\n')
+        )
+      : [];
+
+    sections.push(
+      [
+        'VECTOR_DB_CHUNKS:',
+        vectorChunks.length ? vectorChunks.join('\n\n') : 'No relevant archive chunks found.'
+      ].join('\n')
+    );
+  }
+
+  return sections.join('\n\n').trim();
 }
 
 function compactStructuredResult(structuredContext = {}) {
@@ -2279,60 +3054,88 @@ function rankedRows(rows = []) {
   }));
 }
 
-function buildPublicDetails(question = '', route = {}, structuredContext = {}, vectorContext = {}, cricApiContext = {}, synthesized = {}) {
+function buildPublicDetails(
+  question = '',
+  route = {},
+  structuredContext = {},
+  vectorContext = {},
+  cricApiContext = {},
+  synthesized = {},
+  espnContext = {}
+) {
   const data = structuredContext?.result?.data && typeof structuredContext.result.data === 'object'
     ? structuredContext.result.data
     : {};
   const type = String(data.type || '').trim();
   const fallbackSummary = String(synthesized?.answer || structuredContext?.result?.answer || '').trim();
+  const responseSources = Array.isArray(synthesized?.sources) ? synthesized.sources : [];
+  const detectedEntities = normalizeDetectedEntities(synthesized?.detected_entities).length
+    ? normalizeDetectedEntities(synthesized?.detected_entities)
+    : extractDetectedEntitiesFallback(route, data, fallbackSummary, cricApiContext);
   const normalizedQuestion = normalizeText(question);
   const providerStatus = buildProviderStatus(cricApiContext?.errors || []);
+  const responseMeta = {
+    intent: String(route.action || '').trim(),
+    sub_intent: String(route.sub_intent || '').trim(),
+    answer_mode: String(route.answer_mode || '').trim(),
+    time_context: String(route.time_context || '').trim(),
+    confidence: Number.isFinite(Number(route.confidence)) ? Number(route.confidence) : undefined
+  };
+  const withDetectedEntities = (payload = {}) =>
+    pruneEmptyFields({
+      ...payload,
+      ...responseMeta,
+      ...(detectedEntities.length ? { detected_entities: detectedEntities } : {})
+    });
 
   if (type === 'chat') {
-    return {
+    return withDetectedEntities({
       type,
       title: 'Cricket Intelligence',
       subtitle: 'Ready when you are',
       summary: fallbackSummary,
       message: fallbackSummary
-    };
+    });
   }
   if (type === 'subjective_analysis') {
-    return {
+    return withDetectedEntities({
       type,
       title: 'Analyst View',
       subtitle: 'Data-driven perspective',
       summary: fallbackSummary,
       question: String(data.question || question || '').trim()
-    };
+    });
   }
   if (type === 'player_stats') {
-    const player = data.player || {};
-    return {
+    const player = mergeEspnCareerIntoPlayer(data.player || {}, espnContext?.player || null);
+    return withDetectedEntities({
       type,
       title: String(player.name || 'Player Snapshot'),
       subtitle: String(player.team || player.country || ''),
       summary: fallbackSummary,
       player,
-      stats: data.stats || {},
-      recent_matches: Array.isArray(data.recent_matches) ? data.recent_matches.slice(0, 5).map(slimMatch) : []
-    };
+      stats: hasMeaningfulStats(data.stats || {}) ? data.stats || {} : player.stats || {},
+      chartData: data.chartData && typeof data.chartData === 'object' ? data.chartData : null,
+      recent_matches: Array.isArray(data.recent_matches) ? data.recent_matches.slice(0, 5).map(slimMatch) : [],
+      sources: responseSources
+    });
   }
   if (type === 'team_stats') {
     const team = data.team || {};
-    return {
+    return withDetectedEntities({
       type,
       title: String(team.name || 'Team Snapshot'),
       subtitle: scopeSubtitle(route),
       summary: fallbackSummary,
       team,
       stats: data.stats || {},
-      recent_matches: Array.isArray(data.stats?.recent_matches) ? data.stats.recent_matches.slice(0, 5).map(slimMatch) : []
-    };
+      recent_matches: Array.isArray(data.stats?.recent_matches) ? data.stats.recent_matches.slice(0, 5).map(slimMatch) : [],
+      sources: responseSources
+    });
   }
   if (type === 'team_info') {
     const team = data.team || {};
-    return {
+    return withDetectedEntities({
       type,
       title: String(team.name || 'Team Information'),
       subtitle: 'Team information',
@@ -2340,12 +3143,13 @@ function buildPublicDetails(question = '', route = {}, structuredContext = {}, v
       question: String(data.question || question || '').trim(),
       team,
       stats: data.stats || {},
-      recent_matches: Array.isArray(data.recent_matches) ? data.recent_matches.slice(0, 5).map(slimMatch) : []
-    };
+      recent_matches: Array.isArray(data.recent_matches) ? data.recent_matches.slice(0, 5).map(slimMatch) : [],
+      sources: responseSources
+    });
   }
   if (type === 'team_squad' || type === 'playing_xi') {
     const team = data.team || {};
-    return {
+    return withDetectedEntities({
       type,
       title: String(team.name || 'Team Squad'),
       subtitle: String(data.subtitle || (type === 'playing_xi' ? 'Playing XI' : 'Squad')).trim(),
@@ -2355,33 +3159,37 @@ function buildPublicDetails(question = '', route = {}, structuredContext = {}, v
       coach: String(data.coach || team.coach || '').trim(),
       stats: data.stats || {},
       players: Array.isArray(data.players) ? data.players : [],
-      total_players: Number(data.total_players || 0)
-    };
+      total_players: Number(data.total_players || 0),
+      sources: responseSources
+    });
   }
   if (type === 'match_summary') {
     const match = slimMatch(data.match || {});
-    return {
+    return withDetectedEntities({
       type,
       title: String(match.name || 'Match Summary'),
       subtitle: [match.date, match.venue].filter(Boolean).join(' | '),
       summary: String(match.summary || fallbackSummary),
-      match
-    };
+      match,
+      sources: responseSources
+    });
   }
   if (type === 'compare_players') {
     const left = data.left || {};
     const right = data.right || {};
-    return {
+    return withDetectedEntities({
       type,
       title: `${left.name || 'Player 1'} vs ${right.name || 'Player 2'}`,
       subtitle: scopeSubtitle(route),
       summary: fallbackSummary,
       left,
-      right
-    };
+      right,
+      chartData: data.chartData && typeof data.chartData === 'object' ? data.chartData : null,
+      sources: responseSources
+    });
   }
   if (type === 'head_to_head') {
-    return {
+    return withDetectedEntities({
       type,
       title: `${String(data.team1 || 'Team 1')} vs ${String(data.team2 || 'Team 2')}`,
       subtitle: scopeSubtitle(route),
@@ -2396,23 +3204,26 @@ function buildPublicDetails(question = '', route = {}, structuredContext = {}, v
             no_result: Number(data.stats.no_result || 0)
           }
         : {},
-      recent_matches: Array.isArray(data.stats?.recent_matches) ? data.stats.recent_matches.slice(0, 5).map(slimMatch) : []
-    };
+      recent_matches: Array.isArray(data.stats?.recent_matches) ? data.stats.recent_matches.slice(0, 5).map(slimMatch) : [],
+      sources: responseSources
+    });
   }
   if (type === 'top_players') {
     const metric = String(data.metric || '');
-    return {
+    return withDetectedEntities({
       type,
       title: `Top ${titleCaseMetric(metric)}`,
       subtitle: scopeSubtitle(route),
       summary: fallbackSummary,
       metric,
-      rows: rankedRows(Array.isArray(data.rows) ? data.rows.slice(0, 10) : [])
-    };
+      rows: rankedRows(Array.isArray(data.rows) ? data.rows.slice(0, 10) : []),
+      chartData: data.chartData && typeof data.chartData === 'object' ? data.chartData : null,
+      sources: responseSources
+    });
   }
   if (type === 'record_lookup') {
     const metric = String(data.metric || data.resolved_metric || '');
-    return {
+    return withDetectedEntities({
       type,
       title: String(data.title || (metric ? `Cricket Record: ${titleCaseMetric(metric)}` : 'Cricket Record')),
       subtitle: 'Record lookup',
@@ -2422,18 +3233,34 @@ function buildPublicDetails(question = '', route = {}, structuredContext = {}, v
       metric,
       resolved_metric: String(data.resolved_metric || '').trim(),
       stats: data.stats && typeof data.stats === 'object' ? data.stats : {},
-      rows: rankedRows(Array.isArray(data.rows) ? data.rows.slice(0, 10) : [])
-    };
+      rows: rankedRows(Array.isArray(data.rows) ? data.rows.slice(0, 10) : []),
+      sources: responseSources
+    });
   }
   if (type === 'glossary') {
-    return {
+    return withDetectedEntities({
       type,
       title: titleCaseMetric(String(data.term || 'Glossary')),
       subtitle: 'Cricket term',
       summary: String(structuredContext?.result?.answer || fallbackSummary),
       term: String(data.term || ''),
-      explanation: String(structuredContext?.result?.answer || '')
-    };
+      explanation: String(structuredContext?.result?.answer || ''),
+      sources: responseSources
+    });
+  }
+  if (type === 'general_knowledge') {
+    return withDetectedEntities({
+      type,
+      title: String(data.title || 'Cricket Knowledge').trim() || 'Cricket Knowledge',
+      subtitle: String(data.category || 'Cricket knowledge').trim(),
+      summary: String(structuredContext?.result?.answer || fallbackSummary),
+      question: String(data.question || question || '').trim(),
+      category: String(data.category || '').trim(),
+      related_topics: Array.isArray(data.related_topics) ? data.related_topics.slice(0, 5) : [],
+      examples: Array.isArray(data.examples) ? data.examples.slice(0, 3) : [],
+      fallback_used: Boolean(data.fallback_used),
+      sources: responseSources
+    });
   }
 
   const liveMatch = Array.isArray(cricApiContext.live_scores) ? cricApiContext.live_scores[0] : null;
@@ -2453,7 +3280,7 @@ function buildPublicDetails(question = '', route = {}, structuredContext = {}, v
     const recentMatches = Array.isArray(cricApiContext.live_scores) && cricApiContext.live_scores.length
       ? cricApiContext.live_scores.slice(0, 4).map(slimMatch)
       : archiveRecentMatches.slice(0, 4).map(slimMatch);
-    return {
+    return withDetectedEntities({
       type: 'live_update',
       title: upcomingMatches.length ? 'Upcoming Matches' : recentMatches.length ? 'Live Match Center' : 'Match Center',
       subtitle: scopeSubtitle(route),
@@ -2463,16 +3290,18 @@ function buildPublicDetails(question = '', route = {}, structuredContext = {}, v
       upcoming_matches: upcomingMatches,
       recent_matches: recentMatches,
       player: slimPlayerProfile(playerProfile || {}),
-      provider_status: providerStatus
-    };
+      provider_status: providerStatus,
+      sources: responseSources
+    });
   }
 
-  return {
+  return withDetectedEntities({
     type: 'summary',
     title: 'Cricket Intelligence',
     subtitle: '',
-    summary: fallbackSummary
-  };
+    summary: fallbackSummary,
+    sources: responseSources
+  });
 }
 
 async function safeCricApiCall(loader) {
@@ -2485,6 +3314,104 @@ async function safeCricApiCall(loader) {
       config_error: error instanceof CricApiConfigError || error?.name === 'CricApiConfigError'
     };
   }
+}
+
+async function safeCricbuzzCall(loader) {
+  try {
+    return { ok: true, value: await loader() };
+  } catch (error) {
+    const friendlyError = error?.details?.subscription_required
+      ? 'Cricbuzz stats are unavailable because the current RapidAPI subscription does not include this endpoint.'
+      : error?.message || 'Cricbuzz request failed.';
+    return {
+      ok: false,
+      error: friendlyError,
+      config_error: error instanceof CricbuzzApiConfigError || error?.name === 'CricbuzzApiConfigError'
+    };
+  }
+}
+
+async function safeEspnCall(loader) {
+  try {
+    return { ok: true, value: await loader() };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error?.message || 'ESPN request failed.',
+      config_error: error instanceof EspnServiceError || error?.name === 'EspnServiceError'
+    };
+  }
+}
+
+function shouldUseEspnFallback(route = {}, structuredContext = {}, cricApiContext = {}) {
+  const action = String(route.action || '').trim();
+  if (!['player_stats', 'player_season_stats', 'compare_players'].includes(action)) {
+    return false;
+  }
+
+  const structuredPlayers = [
+    structuredContext?.result?.data?.player,
+    structuredContext?.result?.data?.left,
+    structuredContext?.result?.data?.right
+  ].filter((item) => item && typeof item === 'object');
+  if (structuredPlayers.some((player) => !hasMeaningfulStats(toPlayerStats(player)))) {
+    return true;
+  }
+
+  const liveProfiles = Array.isArray(cricApiContext?.player_profiles) ? cricApiContext.player_profiles : [];
+  return !liveProfiles.length;
+}
+
+async function buildEspnContext(route = {}, question = '', structuredContext = {}, cricApiContext = {}) {
+  const context = createEmptyEspnContext();
+  if (!shouldUseEspnFallback(route, structuredContext, cricApiContext)) {
+    return context;
+  }
+
+  const playerQueries = uniqueNonEmpty([
+    route.player,
+    route.player1,
+    route.player2,
+    structuredContext?.result?.data?.player?.name,
+    structuredContext?.result?.data?.left?.name,
+    structuredContext?.result?.data?.right?.name,
+    removeGenericWords(question)
+  ]).slice(0, 2);
+
+  if (!playerQueries.length) {
+    return context;
+  }
+
+  const searchResults = await Promise.all(
+    playerQueries.map(async (query) => ({
+      query,
+      result: await safeEspnCall(() => getPlayerCareerByQuery(query, { limit: 3 }))
+    }))
+  );
+
+  for (const item of searchResults) {
+    if (!item.result.ok) {
+      context.errors.push(item.result.error);
+      continue;
+    }
+    context.player_searches.push({
+      query: item.query,
+      items: [
+        {
+          id: String(item.result.value?.player?.id || '').trim(),
+          name: String(item.result.value?.player?.name || '').trim(),
+          team: String(item.result.value?.player?.team || '').trim()
+        }
+      ].filter((entry) => entry.id && entry.name)
+    });
+    if (!context.player && item.result.value?.player) {
+      context.player = item.result.value.player;
+    }
+  }
+
+  context.errors = uniqueNonEmpty(context.errors);
+  context.available = Boolean(context.player);
+  return context;
 }
 
 async function buildCricApiContext(route, question) {
@@ -2640,17 +3567,226 @@ async function buildCricApiContext(route, question) {
   return context;
 }
 
+async function buildCricbuzzContext(route, question) {
+  const { playerHints } = deriveEntityHints(question, route);
+  const context = createEmptyCricbuzzContext();
+
+  if (!playerHints.length) {
+    return context;
+  }
+
+  const searchResults = await Promise.all(
+    playerHints.slice(0, 2).map(async (hint) => ({
+      query: hint,
+      result: await safeCricbuzzCall(() => searchCricbuzzPlayers({ q: hint, limit: 3 }))
+    }))
+  );
+
+  for (const item of searchResults) {
+    if (!item.result.ok) {
+      context.errors.push(item.result.error);
+      continue;
+    }
+    context.player_searches.push({
+      query: item.query,
+      items: Array.isArray(item.result.value?.items) ? item.result.value.items : []
+    });
+  }
+
+  const playerCards = await Promise.all(
+    context.player_searches
+      .map((row) => row.items?.[0]?.name)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map(async (name) => safeCricbuzzCall(() => getCricbuzzPlayerCardByName(name)))
+  );
+
+  for (const card of playerCards) {
+    if (!card.ok) {
+      context.errors.push(card.error);
+      continue;
+    }
+    if (card.value?.player) {
+      context.players.push(card.value.player);
+    }
+  }
+
+  context.errors = uniqueNonEmpty(context.errors);
+  context.available = Boolean(context.player_searches.length || context.players.length);
+  return context;
+}
+
+async function executeRouteDataSources(route, question, { onStatus, structuredContext = null } = {}) {
+  const requestedSources = resolveRequestedDataSources(route, question);
+  let vectorContext = createEmptyVectorContext();
+  let livePayload = null;
+  let cricbuzzContext = createEmptyCricbuzzContext();
+  let espnContext = createEmptyEspnContext();
+  let liveFailureMessage = '';
+  let cricbuzzFailureMessage = '';
+
+  if (!requestedSources.length) {
+    const cricApiContext = createEmptyCricApiContext();
+    return {
+      requestedSources,
+      vectorContext,
+      cricApiContext,
+      cricbuzzContext,
+      espnContext,
+      livePayload,
+      mergedApiContext: buildMergedApiContext({
+        question,
+        route,
+        vectorContext,
+        cricApiContext,
+        cricbuzzContext,
+        espnContext
+      }),
+      mergedEvidenceContext: ''
+    };
+  }
+
+  if (requestedSources.includes(DATA_SOURCE.VECTOR_DB)) {
+    emitStatus(onStatus, {
+      stage: 'search',
+      action: route.action,
+      message: actionStatusMessage(route.action)
+    });
+  }
+  if (requestedSources.includes(DATA_SOURCE.LOCAL_KNOWLEDGE)) {
+    emitStatus(onStatus, {
+      stage: 'knowledge',
+      action: route.action,
+      message: actionStatusMessage(route.action)
+    });
+  }
+  if (requestedSources.includes(DATA_SOURCE.CRICAPI_LIVE)) {
+    emitStatus(onStatus, {
+      stage: 'live',
+      message: 'Checking latest match data.'
+    });
+  }
+  if (requestedSources.includes(DATA_SOURCE.CRICBUZZ_STATS)) {
+    emitStatus(onStatus, {
+      stage: 'expert_stats',
+      message: 'Collecting Cricbuzz player intelligence.'
+    });
+  }
+  if (['player_stats', 'player_season_stats', 'compare_players'].includes(String(route.action || '').trim())) {
+    emitStatus(onStatus, {
+      stage: 'career_fallback',
+      message: 'Checking ESPN fallback career data.'
+    });
+  }
+
+  const vectorPromise = requestedSources.includes(DATA_SOURCE.VECTOR_DB)
+    ? queryVectorDb(question, { k: 5 })
+    : Promise.resolve(vectorContext);
+  const livePromise = requestedSources.includes(DATA_SOURCE.CRICAPI_LIVE)
+    ? buildCricApiContext(route, question)
+    : Promise.resolve(null);
+  const cricbuzzPromise = requestedSources.includes(DATA_SOURCE.CRICBUZZ_STATS)
+    ? buildCricbuzzContext(route, question)
+    : Promise.resolve(cricbuzzContext);
+  const espnPromise = ['player_stats', 'player_season_stats', 'compare_players'].includes(
+    String(route.action || '').trim()
+  )
+    ? buildEspnContext(route, question, structuredContext, livePayload || {})
+    : Promise.resolve(espnContext);
+
+  const [vectorResult, liveResult, cricbuzzResult, espnResult] = await Promise.allSettled([
+    vectorPromise,
+    livePromise,
+    cricbuzzPromise,
+    espnPromise
+  ]);
+
+  vectorContext =
+    vectorResult.status === 'fulfilled'
+      ? vectorResult.value
+      : createEmptyVectorContext(vectorResult.reason?.message || 'vector_query_failed');
+
+  if (liveResult.status === 'fulfilled') {
+    livePayload = liveResult.value;
+  } else {
+    liveFailureMessage = liveResult.reason?.message || 'Live data is currently unavailable.';
+    livePayload = null;
+  }
+
+  if (cricbuzzResult.status === 'fulfilled') {
+    cricbuzzContext = cricbuzzResult.value;
+  } else {
+    cricbuzzFailureMessage =
+      cricbuzzResult.reason?.message || 'Cricbuzz player statistics are currently unavailable.';
+    cricbuzzContext = createEmptyCricbuzzContext([cricbuzzFailureMessage]);
+  }
+
+  const cricApiContext = livePayload || createEmptyCricApiContext([liveFailureMessage]);
+  if (!cricbuzzContext.available && cricbuzzFailureMessage) {
+    cricbuzzContext = createEmptyCricbuzzContext([cricbuzzFailureMessage]);
+  }
+
+  if (espnResult.status === 'fulfilled') {
+    espnContext = espnResult.value;
+  } else {
+    espnContext = createEmptyEspnContext([
+      espnResult.reason?.message || 'ESPN fallback unavailable.'
+    ]);
+  }
+
+  const finalMergedApiContext = buildMergedApiContext({
+    question,
+    route,
+    structuredContext,
+    vectorContext,
+    cricApiContext,
+    cricbuzzContext,
+    espnContext
+  });
+
+  return {
+    requestedSources,
+    vectorContext,
+    cricApiContext,
+    cricbuzzContext,
+    espnContext,
+    livePayload,
+    mergedApiContext: finalMergedApiContext,
+    // This merged block is fed to the synthesis model for compound questions.
+    mergedEvidenceContext: buildMergedEvidenceContext({
+      question,
+      route: {
+        ...route,
+        data_sources: requestedSources
+      },
+      vectorContext,
+      livePayload,
+      cricbuzzContext,
+      espnContext
+    })
+  };
+}
+
 async function buildStructuredContext(route, question) {
   const effectiveRoute = await refineRouteForQuestion(route, question);
-  if (effectiveRoute.action === 'chit_chat') {
+  if (isGeneralConversationAction(effectiveRoute.action)) {
     return {
       cache_ready: false,
       available: false,
       result: {
         answer: '',
         data: { type: 'chat' },
-        followups: ['Show live scores', 'Virat Kohli stats', 'Upcoming matches']
+        followups: ['Show live scores', 'Show player stats', 'Upcoming matches']
       },
+      route: effectiveRoute
+    };
+  }
+  if (effectiveRoute.action === 'general_knowledge') {
+    const result = await runGeneralKnowledge(effectiveRoute, question);
+    return {
+      cache_ready: true,
+      available: Boolean(String(result?.answer || '').trim()),
+      result,
       route: effectiveRoute
     };
   }
@@ -2659,7 +3795,7 @@ async function buildStructuredContext(route, question) {
       (String(question || '').match(/\b[A-Za-z]{2,5}\b/g) || []).map((token) => token.trim())
     );
     const [playerLookup, teamLookup] = await Promise.all([
-      resolveEntityWithFallback('player', [route.player, route.player1, route.player2, removeGenericWords(question)]),
+      resolveEntityWithFallback('player', [route.player, route.player1, route.player2, removeGenericWords(question)], { question }),
       resolveEntityWithFallback('team', [route.team, route.team1, route.team2, ...shortEntityHints, ...buildPhraseCandidates(question), removeGenericWords(question)])
     ]);
     const subject =
@@ -2712,6 +3848,18 @@ async function buildStructuredContext(route, question) {
       route: effectiveRoute
     };
   }
+  if (effectiveRoute.action === 'live_update') {
+    return {
+      cache_ready: true,
+      available: true,
+      result: {
+        answer: '',
+        data: { type: 'live_update' },
+        followups: []
+      },
+      route: effectiveRoute
+    };
+  }
 
   let result = unavailableResult();
   if (effectiveRoute.action === 'player_stats' || effectiveRoute.action === 'player_season_stats') {
@@ -2749,15 +3897,73 @@ function buildChitChatAnswer(question = '') {
   const normalizedQuestion = normalizeText(question);
 
   if (/\b(thanks|thank you)\b/.test(normalizedQuestion)) {
-    return "You're welcome. I can help with live scores, player stats, comparisons, and upcoming matches. What do you want to check next?";
+    return "You're welcome. Ask me for live scores, player stats, or match predictions.";
   }
-  if (/\bwho are you\b/.test(normalizedQuestion)) {
-    return 'I am your Cricket AI assistant. Ask me about live matches, player records, team trends, or upcoming fixtures.';
+  if (/\bwho are you\b|\bwho are u\b|\bwho r u\b|\bwho made you\b|\bwho built you\b|\bwho created you\b/.test(normalizedQuestion)) {
+    return 'I am your Cricket AI assistant. Ask me about live scores, player stats, or match predictions.';
   }
-  if (/\bhow are you\b/.test(normalizedQuestion)) {
-    return 'Ready and on signal. Tell me which player, team, or live match you want to explore.';
+  if (/\bhow are you\b|\bwhat can you do\b|\bwhat can u do\b/.test(normalizedQuestion)) {
+    return 'Ready to help. Ask me about live scores, player stats, or match predictions.';
   }
-  return 'Hi. I am your Cricket AI assistant. Tell me which player, live match, or stat line you want to explore today.';
+  if (/\b(hi|hello|hey|hii|heya|yo|sup)\b/.test(normalizedQuestion)) {
+    return 'Hi. Ask me about live scores, player stats, or match predictions.';
+  }
+  return 'I can answer that briefly, but I am built for cricket. Ask me about live scores or player stats.';
+}
+
+async function buildConversationalFallbackAnswer(question = '') {
+  const messages = [
+    {
+      role: 'system',
+      content: GENERAL_CHAT_SYSTEM_PROMPT
+    },
+    {
+      role: 'user',
+      content: String(question || '').trim()
+    }
+  ];
+  const followups = ['Show live scores', 'Show player stats', 'Predict a match'];
+
+  try {
+    const content = await callOpenAiChatCompletions(messages, {
+      temperature: 0.4,
+      timeoutMs: 30000
+    });
+    const answer = String(content || '').replace(/\s+/g, ' ').trim();
+    if (answer) {
+      return {
+        answer,
+        followups,
+        sources: []
+      };
+    }
+  } catch (_) {
+    // Fall through to the generic LLM provider or local fallback.
+  }
+
+  try {
+    const content = await callLlama(messages, {
+      purpose: 'reasoning',
+      temperature: 0.4,
+      timeoutMs: 30000
+    });
+    const answer = String(content || '').replace(/\s+/g, ' ').trim();
+    if (answer) {
+      return {
+        answer,
+        followups,
+        sources: []
+      };
+    }
+  } catch (_) {
+    // Fall back to the local short response below.
+  }
+
+  return {
+    answer: buildChitChatAnswer(question),
+    followups,
+    sources: []
+  };
 }
 
 async function canonicalizeLeaderboardRows(rows = []) {
@@ -2996,13 +4202,34 @@ async function enrichStructuredResult(structuredContext = {}, route = {}, questi
   return structuredContext;
 }
 
-function buildSourceList(structuredContext, vectorContext, cricApiContext, modelSources = []) {
+function buildSourceList(
+  structuredContext,
+  vectorContext,
+  cricApiContext,
+  modelSources = [],
+  cricbuzzContext = {},
+  espnContext = {}
+) {
   const sources = [];
-  if (structuredContext?.available) sources.push('vector_archive');
-  if (vectorContext?.available && Array.isArray(vectorContext.results) && vectorContext.results.length) {
-    sources.push('vector_db');
+  const structuredType = String(structuredContext?.result?.data?.type || '').trim();
+  if (structuredContext?.available) {
+    if (structuredType === 'general_knowledge') {
+      sources.push('Local Knowledge');
+    } else if (structuredType === 'glossary') {
+      sources.push('Glossary');
+    } else {
+      sources.push('Vector Archive');
+    }
   }
-  if (cricApiContext?.available) sources.push('cricapi');
+  if (vectorContext?.available && Array.isArray(vectorContext.results) && vectorContext.results.length) {
+    sources.push('Vector DB');
+  }
+  if (cricApiContext?.available) sources.push('CricAPI');
+  if (cricbuzzContext?.available) sources.push('Cricbuzz');
+  if (espnContext?.available) sources.push('ESPN');
+  if (Array.isArray(cricApiContext?.web_scraper_matches) && cricApiContext.web_scraper_matches.length) {
+    sources.push('Web Scraper');
+  }
   for (const source of modelSources) {
     const clean = String(source || '').trim();
     if (clean && !sources.includes(clean)) {
@@ -3021,6 +4248,14 @@ function defaultFollowups(route = {}, structuredContext = {}) {
       'Compare two players',
       'Show team head to head',
       'Show recent live scores'
+    ];
+  }
+
+  if (route.action === 'general_knowledge' || route.action === 'glossary') {
+    return [
+      'What is LBW?',
+      'Who won WC 2011?',
+      'Difference between ODI and T20'
     ];
   }
 
@@ -3061,7 +4296,15 @@ function shouldUseLooseFallback(question = '', route = {}) {
   return false;
 }
 
-function fallbackAnswer(question, route, structuredContext, vectorContext, cricApiContext) {
+function fallbackAnswer(
+  question,
+  route,
+  structuredContext,
+  vectorContext,
+  cricApiContext,
+  cricbuzzContext = {},
+  espnContext = {}
+) {
   const structuredType = String(structuredContext?.result?.data?.type || '').trim();
   const normalizedQuestion = normalizeText(question);
   const isLiveOrScheduleQuery =
@@ -3071,7 +4314,7 @@ function fallbackAnswer(question, route, structuredContext, vectorContext, cricA
     return {
       answer: structuredContext.result.answer,
       followups: defaultFollowups(route, structuredContext),
-      sources: buildSourceList(structuredContext, vectorContext, cricApiContext)
+      sources: buildSourceList(structuredContext, vectorContext, cricApiContext, [], cricbuzzContext, espnContext)
     };
   }
 
@@ -3079,7 +4322,7 @@ function fallbackAnswer(question, route, structuredContext, vectorContext, cricA
     return {
       answer: NOT_AVAILABLE_MESSAGE,
       followups: defaultFollowups(route, structuredContext),
-      sources: buildSourceList(structuredContext, vectorContext, cricApiContext)
+      sources: buildSourceList(structuredContext, vectorContext, cricApiContext, [], cricbuzzContext, espnContext)
     };
   }
 
@@ -3088,7 +4331,7 @@ function fallbackAnswer(question, route, structuredContext, vectorContext, cricA
     return {
       answer: buildLiveAnswer(question, route, cricApiContext),
       followups: defaultFollowups(route, structuredContext),
-      sources: buildSourceList(structuredContext, vectorContext, cricApiContext)
+      sources: buildSourceList(structuredContext, vectorContext, cricApiContext, [], cricbuzzContext, espnContext)
     };
   }
 
@@ -3097,7 +4340,7 @@ function fallbackAnswer(question, route, structuredContext, vectorContext, cricA
     return {
       answer: providerStatus.message,
       followups: defaultFollowups(route, structuredContext),
-      sources: buildSourceList(structuredContext, vectorContext, cricApiContext)
+      sources: buildSourceList(structuredContext, vectorContext, cricApiContext, [], cricbuzzContext, espnContext)
     };
   }
 
@@ -3106,14 +4349,14 @@ function fallbackAnswer(question, route, structuredContext, vectorContext, cricA
     return {
       answer: 'I found relevant archive context, but not enough verified structured evidence to produce a professional cricket summary for that query.',
       followups: defaultFollowups(route, structuredContext),
-      sources: buildSourceList(structuredContext, vectorContext, cricApiContext)
+      sources: buildSourceList(structuredContext, vectorContext, cricApiContext, [], cricbuzzContext, espnContext)
     };
   }
 
   return {
     answer: NOT_AVAILABLE_MESSAGE,
     followups: defaultFollowups(route, structuredContext),
-    sources: buildSourceList(structuredContext, vectorContext, cricApiContext)
+    sources: buildSourceList(structuredContext, vectorContext, cricApiContext, [], cricbuzzContext, espnContext)
   };
 }
 
@@ -3284,10 +4527,20 @@ function buildPlayerFormAnswer(question = '', route = {}, vectorContext = {}) {
     .join('; ')}.`;
 }
 
-function buildGroundedAnswer(question, route, structuredContext, vectorContext, cricApiContext) {
+function buildGroundedAnswer(
+  question,
+  route,
+  structuredContext,
+  vectorContext,
+  cricApiContext,
+  cricbuzzContext = {},
+  espnContext = {}
+) {
   const parts = [];
   const liveAnswer = buildLiveAnswer(question, route, cricApiContext);
   const formAnswer = buildPlayerFormAnswer(question, route, vectorContext);
+  const cricbuzzPlayer = Array.isArray(cricbuzzContext.players) ? cricbuzzContext.players[0] : null;
+  const espnPlayer = espnContext?.player && typeof espnContext.player === 'object' ? espnContext.player : null;
 
   if (LIVE_QUERY_REGEX.test(normalizeText(question)) || SCHEDULE_QUERY_REGEX.test(normalizeText(question))) {
     if (liveAnswer) parts.push(liveAnswer);
@@ -3308,6 +4561,28 @@ function buildGroundedAnswer(question, route, structuredContext, vectorContext, 
     if (formAnswer) parts.push(formAnswer);
   }
 
+  if (cricbuzzPlayer?.name && Object.keys(cricbuzzPlayer.stats || {}).length) {
+    const statBits = uniqueNonEmpty([
+      cricbuzzPlayer.stats.runs !== undefined ? `Runs: ${cricbuzzPlayer.stats.runs}` : '',
+      cricbuzzPlayer.stats.average !== undefined ? `Average: ${cricbuzzPlayer.stats.average}` : '',
+      cricbuzzPlayer.stats.strike_rate !== undefined ? `Strike Rate: ${cricbuzzPlayer.stats.strike_rate}` : '',
+      cricbuzzPlayer.stats.wickets !== undefined ? `Wickets: ${cricbuzzPlayer.stats.wickets}` : ''
+    ]);
+    if (statBits.length) {
+      parts.push(`${cricbuzzPlayer.name} Cricbuzz snapshot\n${statBits.join('\n')}`);
+    }
+  }
+
+  if (espnPlayer?.name && hasMeaningfulStats(espnPlayer.career_summary || {})) {
+    parts.push(
+      `${espnPlayer.name} ESPN career fallback\nRuns: ${espnPlayer.career_summary.runs || 0}\nAverage: ${
+        espnPlayer.career_summary.average || 0
+      }\nStrike Rate: ${espnPlayer.career_summary.strike_rate || 0}\nWickets: ${
+        espnPlayer.career_summary.wickets || 0
+      }`
+    );
+  }
+
   if (structuredContext?.available && structuredContext?.result?.answer && parts.length === 0) {
     parts.push(structuredContext.result.answer);
   }
@@ -3316,74 +4591,91 @@ function buildGroundedAnswer(question, route, structuredContext, vectorContext, 
   return {
     answer: parts.join('\n\n'),
     followups: defaultFollowups(route, structuredContext),
-    sources: buildSourceList(structuredContext, vectorContext, cricApiContext)
+    sources: buildSourceList(structuredContext, vectorContext, cricApiContext, [], cricbuzzContext, espnContext)
   };
 }
 
-async function synthesizeAnswer(question, route, structuredContext, vectorContext, cricApiContext) {
-  if (route.action === 'chit_chat') {
+async function synthesizeAnswer(
+  question,
+  route,
+  structuredContext,
+  vectorContext,
+  cricApiContext,
+  cricbuzzContext,
+  espnContext,
+  executionContext = {}
+) {
+  if (isGeneralConversationAction(route.action)) {
+    return await buildConversationalFallbackAnswer(question);
+  }
+  if (route.action === 'general_knowledge' || route.action === 'glossary') {
     return {
-      answer: buildChitChatAnswer(question),
-      followups: ['Show live scores', 'Virat Kohli stats', 'Upcoming matches'],
-      sources: []
+      answer: String(structuredContext?.result?.answer || '').trim() || NOT_AVAILABLE_MESSAGE,
+      followups: defaultFollowups(route, structuredContext),
+      sources: buildSourceList(structuredContext, vectorContext, cricApiContext, [], cricbuzzContext, espnContext)
     };
   }
-  const openEndedReasoning = ['subjective_analysis', 'team_info', 'record_lookup'].includes(route.action);
-
-  if (!openEndedReasoning) {
+  if (route.action === 'live_update') {
     const grounded = buildGroundedAnswer(
       question,
       route,
       structuredContext,
       vectorContext,
-      cricApiContext
+      cricApiContext,
+      cricbuzzContext,
+      espnContext
     );
     if (grounded) {
       return grounded;
     }
+    return {
+      answer: '',
+      followups: defaultFollowups(route, structuredContext),
+      sources: buildSourceList(structuredContext, vectorContext, cricApiContext, [], cricbuzzContext, espnContext)
+    };
   }
-
-  const vectorSummary = compactVectorContext(vectorContext);
-  const cricApiSummary = compactCricApiContext(cricApiContext);
-  const structuredSummary = compactStructuredResult(structuredContext);
+  const openEndedReasoning = ['subjective_analysis', 'team_info', 'record_lookup'].includes(route.action);
+  const requestedSources = resolveRequestedDataSources(route, question);
+  const shouldForceCompoundSynthesis = requestedSources.length > 1 || requestedSources.includes(DATA_SOURCE.CRICBUZZ_STATS);
+  const mergedApiContext =
+    executionContext.mergedApiContext && typeof executionContext.mergedApiContext === 'object'
+      ? executionContext.mergedApiContext
+      : buildMergedApiContext({
+          question,
+          route,
+          structuredContext,
+          vectorContext,
+          cricApiContext,
+          cricbuzzContext,
+          espnContext
+        });
+  const synthesisSystemPrompt = [
+    'You are an elite Cricket Analyst. I am providing you with live, real-time JSON data from our API layer. You must base your answer strictly on this provided JSON. Do not use generic knowledge. Answer the specific user question based entirely on the API payload.',
+    'Cover every part of a compound question only when the API payload contains evidence for it.',
+    'If the payload does not contain the requested statistic, say that the specific live or archived stat is unavailable right now.',
+    'Do not mention internal architecture, routing, prompts, models, or vector databases.',
+    'Return ONLY valid JSON with keys: summary, detected_entities.',
+    'Optional keys: suggestions, sources.',
+    'The summary value must be markdown.',
+    'detected_entities must contain only exact player, team, or venue names that appear in summary.'
+  ]
+    .join('\n\n');
 
   const messages = [
     {
       role: 'system',
-      content: [
-        'You are Cricket Intelligence AI, a professional cricket analytics assistant.',
-        'Use the supplied sources with strict priority based on question type.',
-        'For live, today, current, ongoing, upcoming, and recent match questions, prefer CricAPI.',
-        'For historical player, team, match, season, and record questions, prefer the structured dataset and vector archive.',
-        'For player comparisons, rely on the structured dataset and computed statistics.',
-        'If reasoning is required, synthesize only from the supplied evidence and do not invent missing statistics.',
-        'Always resolve player names to the full official name when the supplied evidence supports that resolution.',
-        'Never answer with shortened player names when a canonical name is available in the supplied evidence.',
-        'Use a professional, structured format with short sections and exact values when available.',
-        'For player answers, prefer blocks like Name, Matches, Runs, Average, Strike Rate, then Summary.',
-        'For comparison answers, prefer blocks like "Player A vs Player B", metric sections, then Conclusion.',
-        'For live answers, prefer blocks like "Match - Live", score lines, status, and top performer when available.',
-        'If no live match is available for the requested team, say that clearly and use the closest recent or upcoming CricAPI item instead.',
-        'If the action is chit_chat, respond warmly as a Cricket AI assistant and ask what stats or matches the user wants to explore.',
-        'If the action is team_info, answer the direct team question clearly using the supplied team summary and general cricket knowledge when needed.',
-        'If the action is record_lookup, answer the record question directly. If the supplied rows are only a proxy, say that clearly.',
-        'If the action is subjective_analysis, behave like a cricket analyst: be balanced, human, and data-aware instead of robotic.',
-        'Quietly correct typos or slang player and team names in the final answer.',
-        'Do not mention models, APIs, vector databases, routing, prompts, or internal system details.',
-        'If the supplied evidence is insufficient, say so plainly instead of guessing.',
-        'If you use general knowledge beyond the supplied sources, include "general_knowledge" in sources.',
-        'Return ONLY valid JSON with keys: summary, suggestions, sources.'
-      ].join('\n')
+      content: synthesisSystemPrompt
+    },
+    {
+      role: 'system',
+      content: JSON.stringify(mergedApiContext, null, 2)
     },
     {
       role: 'user',
       content: JSON.stringify(
         {
-          question,
-          route,
-          structured_dataset: structuredSummary,
-          vector_archive: vectorSummary,
-          cricapi: cricApiSummary
+          user_question: question,
+          api_payload: mergedApiContext
         },
         null,
         2
@@ -3392,23 +4684,54 @@ async function synthesizeAnswer(question, route, structuredContext, vectorContex
   ];
 
   try {
-    const content = await callLlama(messages, {
-      temperature: 0.2,
-      timeoutMs: 45000,
-      purpose: 'reasoning'
-    });
+    let content = '';
+    try {
+      content = await callOpenAiChatCompletions(messages, {
+        temperature: 0.2,
+        timeoutMs: 60000
+      });
+    } catch (_) {
+      content = await callLlama(messages, {
+        purpose: 'reasoning',
+        temperature: 0.2,
+        timeoutMs: 60000
+      });
+    }
     const parsed = extractJsonFromText(content);
-    if (parsed && typeof parsed === 'object' && String(parsed.summary || parsed.answer || '').trim()) {
+    if (parsed && typeof parsed === 'object' && String(parsed.summary || parsed.synthesized_text || parsed.answer || '').trim()) {
       return {
-        answer: String(parsed.summary || parsed.answer || '').trim(),
+        answer: String(parsed.summary || parsed.synthesized_text || parsed.answer || '').trim(),
+        detected_entities: uniqueNonEmpty(Array.isArray(parsed.detected_entities) ? parsed.detected_entities : []).slice(0, 12),
         followups: uniqueNonEmpty(
           Array.isArray(parsed.suggestions) ? parsed.suggestions : Array.isArray(parsed.followups) ? parsed.followups : []
         ).slice(0, 3),
-        sources: uniqueNonEmpty(Array.isArray(parsed.sources) ? parsed.sources : [])
+        sources: buildSourceList(
+          structuredContext,
+          vectorContext,
+          cricApiContext,
+          uniqueNonEmpty(Array.isArray(parsed.sources) ? parsed.sources : []),
+          cricbuzzContext,
+          espnContext
+        )
       };
     }
   } catch (_) {
     // Fall back to the grounded answer builders below.
+  }
+
+  if (!openEndedReasoning && !shouldForceCompoundSynthesis) {
+    const grounded = buildGroundedAnswer(
+      question,
+      route,
+      structuredContext,
+      vectorContext,
+      cricApiContext,
+      cricbuzzContext,
+      espnContext
+    );
+    if (grounded) {
+      return grounded;
+    }
   }
 
   if (route.action === 'subjective_analysis') {
@@ -3427,7 +4750,15 @@ async function synthesizeAnswer(question, route, structuredContext, vectorContex
     return buildRecordFallbackAnswer(question, structuredContext);
   }
 
-  return fallbackAnswer(question, route, structuredContext, vectorContext, cricApiContext);
+  return fallbackAnswer(
+    question,
+    route,
+    structuredContext,
+    vectorContext,
+    cricApiContext,
+    cricbuzzContext,
+    espnContext
+  );
 }
 
 async function handleQuery({ question = '', query = '', sessionId = '' } = {}) {
@@ -3457,48 +4788,55 @@ async function processQuery({ question = '', query = '', sessionId = '' } = {}, 
   );
   let structuredContext = await buildStructuredContext(route, effectiveText);
   const effectiveRoute = structuredContext.route || route;
-  let vectorContext = {
-    available: false,
-    warning: '',
-    results: []
-  };
-  let cricApiContext = {
-    provider: 'cricapi',
-    available: false,
-    errors: [],
-    player_searches: [],
-    player_profiles: [],
-    live_scores: [],
-    schedule: [],
-    series: [],
-    series_info: null
+  let vectorContext = createEmptyVectorContext();
+  let cricApiContext = createEmptyCricApiContext();
+  let cricbuzzContext = createEmptyCricbuzzContext();
+  let espnContext = createEmptyEspnContext();
+  let executionContext = {
+    requestedSources: resolveRequestedDataSources(effectiveRoute, effectiveText),
+    livePayload: null,
+    cricbuzzContext,
+    espnContext,
+    mergedApiContext: buildMergedApiContext({
+      question: effectiveText,
+      route: effectiveRoute,
+      structuredContext,
+      espnContext
+    }),
+    mergedEvidenceContext: ''
   };
 
-  if (effectiveRoute.action === 'chit_chat') {
+  if (isGeneralConversationAction(effectiveRoute.action)) {
     emitStatus(onStatus, {
       stage: 'responding',
       action: effectiveRoute.action,
       message: actionStatusMessage(effectiveRoute.action)
     });
+  } else if (effectiveRoute.action === 'live_update') {
+    executionContext = await executeRouteDataSources(effectiveRoute, effectiveText, { onStatus });
+    cricApiContext = executionContext.cricApiContext;
   } else {
     structuredContext = await enrichStructuredResult(structuredContext, effectiveRoute, effectiveText);
-    emitStatus(onStatus, {
-      stage: 'search',
-      action: effectiveRoute.action,
-      message: structuredContext.cache_ready ? actionStatusMessage(effectiveRoute.action) : 'Searching saved records.'
+    executionContext = await executeRouteDataSources(effectiveRoute, effectiveText, {
+      onStatus,
+      structuredContext
     });
-    const vectorPromise = queryVectorDb(effectiveText, { k: 5 });
-
-    emitStatus(onStatus, {
-      stage: 'live',
-      message: 'Checking latest match data.'
-    });
-    const cricApiPromise = buildCricApiContext(effectiveRoute, effectiveText);
-
-    [vectorContext, cricApiContext] = await Promise.all([vectorPromise, cricApiPromise]);
+    vectorContext = executionContext.vectorContext;
+    cricApiContext = executionContext.cricApiContext;
+    cricbuzzContext = executionContext.cricbuzzContext;
+    espnContext = executionContext.espnContext;
   }
 
-  if (effectiveRoute.action !== 'chit_chat') {
+  if (!isGeneralConversationAction(effectiveRoute.action)) {
+    executionContext.mergedApiContext = buildMergedApiContext({
+      question: effectiveText,
+      route: effectiveRoute,
+      structuredContext,
+      vectorContext,
+      cricApiContext,
+      cricbuzzContext,
+      espnContext
+    });
     emitStatus(onStatus, {
       stage: 'synthesizing',
       message: 'Preparing answer.'
@@ -3509,7 +4847,10 @@ async function processQuery({ question = '', query = '', sessionId = '' } = {}, 
     effectiveRoute,
     structuredContext,
     vectorContext,
-    cricApiContext
+    cricApiContext,
+    cricbuzzContext,
+    espnContext,
+    executionContext
   );
 
   const publicDetails = buildPublicDetails(
@@ -3518,7 +4859,8 @@ async function processQuery({ question = '', query = '', sessionId = '' } = {}, 
     structuredContext,
     vectorContext,
     cricApiContext,
-    synthesized
+    synthesized,
+    espnContext
   );
   syncSessionState(session, effectiveRoute, structuredContext, publicDetails);
 

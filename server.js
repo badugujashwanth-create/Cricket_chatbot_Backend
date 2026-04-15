@@ -2,9 +2,12 @@ require('./loadEnv');
 
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const http = require('http');
 const path = require('path');
+const { Server } = require('socket.io');
 const { handleQuery, processQuery } = require('./queryService');
-const { querySemanticCache, saveSemanticCacheEntry, resolveDbDir, readChromaManifest } = require('./chromaService');
+const { querySemanticCache, saveSemanticCacheEntry, resolveDbDir, readChromaManifest, getChromaHealth } = require('./chromaService');
 const { getSession, clearPendingClarification, setPendingClarification, updateContext } = require('./sessionStore');
 const { startDailyIngestor } = require('./workers/dailyIngestor');
 const { getPlayerProfile } = require('./playerProfileService');
@@ -19,6 +22,7 @@ const {
   findMatchesForTeam,
   getTopPlayersByMetric
 } = require('./vectorIndexService');
+const { seedArchiveSnapshot, getStoreStatus } = require('./sqlStatsService');
 const {
   getLiveScores,
   searchPlayers,
@@ -26,13 +30,14 @@ const {
   getMatchSchedule,
   getSeriesList,
   getSeriesInfo,
+  getCricbuzzPlayerCardByName,
   toBoolean,
   toPositiveInteger
 } = require('./cricApiService');
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
-const frontendPath = path.join(__dirname, '../frontend');
+const frontendPath = path.join(__dirname, '../frontend/dist');
 const SESSION_CONTEXT_PRONOUN_REGEX = /\b(he|him|his|she|her|they|them|their)\b/i;
 const CHIT_CHAT_QUERY_REGEX = /^(hi|hello|hey|hii|heya|how are you|who are you|thanks|thank you)\b/i;
 const CACHE_BYPASS_QUERY_REGEX =
@@ -40,7 +45,9 @@ const CACHE_BYPASS_QUERY_REGEX =
 
 app.use(cors());
 app.use(express.json());
-app.use(express.static(frontendPath));
+if (fs.existsSync(frontendPath)) {
+  app.use(express.static(frontendPath));
+}
 
 function toApiMatch(match = {}) {
   const team1 = String(match.team1 || '').trim();
@@ -84,9 +91,81 @@ function toPlayerSearchItem(player = {}) {
   };
 }
 
-function getVectorStatus() {
+function buildPlayerStatsSnapshot(player = {}) {
+  if (!player || typeof player !== 'object') return {};
+  return {
+    matches: Number(player.matches || 0),
+    runs: Number(player.runs || 0),
+    average: Number(player.average || 0),
+    strike_rate: Number(player.strike_rate || 0),
+    wickets: Number(player.wickets || 0),
+    economy: Number(player.economy || 0),
+    fours: Number(player.fours || 0),
+    sixes: Number(player.sixes || 0)
+  };
+}
+
+async function buildFallbackPlayerCard(query = '') {
+  const cleanQuery = String(query || '').trim();
+  if (!cleanQuery) return null;
+
+  let vectorPlayer = null;
+  let livePlayer = null;
+
+  try {
+    const vectorMatches = await searchVectorPlayers(cleanQuery, 5);
+    vectorPlayer = Array.isArray(vectorMatches) ? vectorMatches[0] || null : null;
+  } catch (_) {
+    vectorPlayer = null;
+  }
+
+  if (!vectorPlayer) {
+    try {
+      const liveSearch = await searchPlayers({ q: cleanQuery, limit: 5 });
+      livePlayer = Array.isArray(liveSearch?.items) ? liveSearch.items[0] || null : null;
+    } catch (_) {
+      livePlayer = null;
+    }
+  }
+
+  const datasetName = String(
+    vectorPlayer?.canonical_name || vectorPlayer?.name || livePlayer?.name || cleanQuery
+  ).trim();
+  const profile = await getPlayerProfile({
+    query: cleanQuery,
+    datasetName
+  }).catch(() => null);
+
+  const resolvedName = String(
+    profile?.canonical_name || vectorPlayer?.canonical_name || vectorPlayer?.name || livePlayer?.name || cleanQuery
+  ).trim();
+  if (!resolvedName) return null;
+
+  const description = String(profile?.description || profile?.short_description || '').trim();
+
+  return {
+    provider: 'fallback',
+    fallback: true,
+    player: {
+      id: String(vectorPlayer?.id || livePlayer?.id || '').trim(),
+      name: resolvedName,
+      team: String(vectorPlayer?.team || livePlayer?.team || '').trim(),
+      country: String(profile?.country || livePlayer?.country || '').trim(),
+      role: String(vectorPlayer?.role || '').trim(),
+      batting_style: '',
+      bowling_style: '',
+      image_url: String(profile?.image_url || livePlayer?.image_url || '').trim(),
+      wikipedia_url: String(profile?.wikipedia_url || '').trim(),
+      description: description || `${resolvedName} is available from the local cricket profile fallback.`,
+      stats: vectorPlayer ? buildPlayerStatsSnapshot(vectorPlayer) : {}
+    }
+  };
+}
+
+async function getVectorStatus() {
   const dbDir = resolveDbDir();
   const manifest = readChromaManifest();
+  const chromaHealth = await getChromaHealth({ includeProbe: true });
   const summary = manifest?.dataset_summary && typeof manifest.dataset_summary === 'object'
     ? manifest.dataset_summary
     : {};
@@ -101,12 +180,14 @@ function getVectorStatus() {
       teams: Number(manifest?.team_docs || 0),
       matches: Number(manifest?.match_docs || 0)
     },
-    summary
+    summary,
+    chroma_health: chromaHealth,
+    sql_bridge: getStoreStatus()
   };
 }
 
-app.get('/api/status', (req, res) => {
-  return res.json(getVectorStatus());
+app.get('/api/status', async (req, res) => {
+  return res.json(await getVectorStatus());
 });
 
 function writeSseEvent(res, event, payload) {
@@ -180,7 +261,14 @@ function normalizeCachedStats(response = {}, details = {}) {
 
 function normalizeCachedExtra(response = {}, details = {}) {
   if (response?.extra && typeof response.extra === 'object') {
-    return response.extra;
+    return {
+      ...response.extra,
+      detected_entities: Array.isArray(response.extra?.detected_entities)
+        ? response.extra.detected_entities
+        : Array.isArray(response?.detected_entities)
+          ? response.detected_entities
+          : []
+    };
   }
 
   const suggestions = Array.isArray(response?.suggestions)
@@ -192,7 +280,8 @@ function normalizeCachedExtra(response = {}, details = {}) {
   const extra = {
     action: String(details.type || response.type || 'summary').trim(),
     suggestions,
-    insights
+    insights,
+    detected_entities: Array.isArray(response?.detected_entities) ? response.detected_entities : []
   };
 
   if (details.player) {
@@ -249,7 +338,8 @@ function normalizeCachedResponseShape(response = {}, fallbackQuestion = '') {
     image: normalizeCachedImage(response, details),
     summary,
     stats: normalizeCachedStats(response, details),
-    extra: normalizeCachedExtra(response, details)
+    extra: normalizeCachedExtra(response, details),
+    detected_entities: Array.isArray(response?.detected_entities) ? response.detected_entities : []
   };
 }
 
@@ -340,8 +430,9 @@ function syncSessionFromResponse(sessionId = '', response = {}) {
 
 app.get('/api/about', async (req, res) => {
   const manifest = readChromaManifest();
+  const status = await getVectorStatus();
   return res.json({
-    ...getVectorStatus(),
+    ...status,
     built_at: String(manifest?.built_at || ''),
     min_date: String(manifest?.dataset_summary?.min_date || ''),
     max_date: String(manifest?.dataset_summary?.max_date || '')
@@ -350,6 +441,7 @@ app.get('/api/about', async (req, res) => {
 
 app.get('/api/home', async (req, res) => {
   const manifest = readChromaManifest();
+  const status = await getVectorStatus();
   const [topBatters, topBowlers, teams, recentMatches] = await Promise.all([
     getTopPlayersByMetric('runs', { limit: 5 }),
     getTopPlayersByMetric('wickets', { limit: 5 }),
@@ -358,7 +450,7 @@ app.get('/api/home', async (req, res) => {
   ]);
 
   return res.json({
-    status: getVectorStatus(),
+    status,
     summary: manifest?.dataset_summary || {},
     leaders: {
       runs: topBatters,
@@ -575,6 +667,67 @@ app.get('/api/cricapi/series/:id', async (req, res) => {
   }
 });
 
+app.get('/api/cricbuzz/player-card', async (req, res) => {
+  try {
+    const query = String(req.query.name || req.query.q || '').trim();
+    if (!query) {
+      return res.status(400).json({
+        message: 'Player name is required.'
+      });
+    }
+
+    const result = await getCricbuzzPlayerCardByName(query);
+    const player = result?.player || null;
+
+    if (!player) {
+      const fallback = await buildFallbackPlayerCard(query);
+      if (fallback?.player) {
+        return res.json({
+          ...fallback,
+          fallback_reason: 'no_cricbuzz_match'
+        });
+      }
+      return res.status(404).json({
+        message: 'No player profile matched that entity.'
+      });
+    }
+
+    const profile = await getPlayerProfile({
+      query: player.name,
+      datasetName: player.name
+    }).catch(() => null);
+
+    return res.json({
+      provider: 'cricbuzz',
+      player: {
+        id: String(player.id || '').trim(),
+        name: String(player.name || '').trim(),
+        team: String(player.team || '').trim(),
+        country: String(player.country || profile?.country || '').trim(),
+        role: String(player.role || '').trim(),
+        batting_style: String(player.batting_style || '').trim(),
+        bowling_style: String(player.bowling_style || '').trim(),
+        image_url: String(player.image_url || profile?.image_url || '').trim(),
+        wikipedia_url: String(profile?.wikipedia_url || '').trim(),
+        description: String(player.bio || profile?.short_description || profile?.description || '').trim(),
+        stats: player.stats && typeof player.stats === 'object' ? player.stats : {}
+      }
+    });
+  } catch (error) {
+    if (error?.details?.subscription_required || /not subscribed/i.test(String(error?.message || ''))) {
+      const query = String(req.query.name || req.query.q || '').trim();
+      const fallback = await buildFallbackPlayerCard(query);
+      if (fallback?.player) {
+        return res.json({
+          ...fallback,
+          fallback_reason: 'cricbuzz_subscription_unavailable'
+        });
+      }
+    }
+    return handleExternalError(res, error);
+  }
+});
+
 app.post('/api/query', async (req, res) => {
   try {
     const question = String(req.body?.question || req.body?.query || '').trim();
@@ -722,19 +875,48 @@ app.get('*', (req, res) => {
   if (req.path.startsWith('/api')) {
     return res.status(404).json({ message: 'Endpoint not found.' });
   }
-  return res.sendFile(path.join(frontendPath, 'index.html'));
+  if (fs.existsSync(path.join(frontendPath, 'index.html'))) {
+    return res.sendFile(path.join(frontendPath, 'index.html'));
+  }
+  return res.status(503).send('Frontend build not found. Run the Vite build or dev server.');
 });
 
-const server = app.listen(port);
+async function bootstrapSqlBridge() {
+  try {
+    const [players, teams, matches] = await Promise.all([
+      loadPlayerProfiles(),
+      loadTeamSummaries(),
+      loadMatchSummaries()
+    ]);
+    const manifest = readChromaManifest();
+    const result = seedArchiveSnapshot({
+      players,
+      teams,
+      matches,
+      manifest,
+      force: false
+    });
+    if (result.seeded) {
+      console.log('[sql-bridge] archive snapshot seeded');
+    }
+  } catch (error) {
+    console.warn('[sql-bridge] seed skipped:', error?.message || error);
+  }
+}
 
-server.on('listening', () => {
-  const address = server.address();
-  const activePort =
-    address && typeof address === 'object' && Number.isFinite(Number(address.port))
-      ? Number(address.port)
-      : port;
-  console.log(`Server running on http://localhost:${activePort}`);
-  startDailyIngestor();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: '*'
+  }
+});
+
+io.on('connection', (socket) => {
+  socket.emit('live-score-alert', {
+    type: 'socket_ready',
+    title: 'Live feed connected',
+    summary: 'Waiting for live cricket updates.'
+  });
 });
 
 server.on('error', (error) => {
@@ -754,3 +936,18 @@ server.on('error', (error) => {
   console.error('Server failed to start:', error);
   process.exit(1);
 });
+
+async function startServer() {
+  await bootstrapSqlBridge();
+  server.listen(port, () => {
+    const address = server.address();
+    const activePort =
+      address && typeof address === 'object' && Number.isFinite(Number(address.port))
+        ? Number(address.port)
+        : port;
+    console.log(`Server running on http://localhost:${activePort}`);
+    startDailyIngestor({ io });
+  });
+}
+
+void startServer();

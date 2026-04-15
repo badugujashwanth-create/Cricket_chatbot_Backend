@@ -1,10 +1,32 @@
 require('./loadEnv');
 
+const axios = require('axios');
+
 const { normalizeText, similarityScore } = require('./textUtils');
 
 const BASE_URL = 'https://api.cricapi.com/v1/';
 const API_KEY = String(process.env.CRICAPI_KEY || '').trim();
 const REQUEST_TIMEOUT_MS = Number(process.env.CRICAPI_TIMEOUT_MS || 10000);
+const CRICBUZZ_ENABLED = !['0', 'false', 'no'].includes(
+  normalizeText(process.env.CRICBUZZ_ENABLED || 'true')
+);
+const CRICBUZZ_RAPIDAPI_KEY = String(process.env.CRICBUZZ_RAPIDAPI_KEY || '').trim();
+const CRICBUZZ_RAPIDAPI_HOST = String(
+  process.env.CRICBUZZ_RAPIDAPI_HOST || 'cricbuzz-cricket.p.rapidapi.com'
+).trim();
+const CRICBUZZ_BASE_URL = String(
+  process.env.CRICBUZZ_BASE_URL || `https://${CRICBUZZ_RAPIDAPI_HOST}/`
+).trim();
+const CRICBUZZ_TIMEOUT_MS = Number(process.env.CRICBUZZ_TIMEOUT_MS || 12000);
+const CRICBUZZ_SEARCH_PATH = String(
+  process.env.CRICBUZZ_SEARCH_PATH || 'stats/v1/player/search'
+).trim();
+const CRICBUZZ_PLAYER_STATS_PATH = String(
+  process.env.CRICBUZZ_PLAYER_STATS_PATH || 'stats/v1/player/{playerId}'
+).trim();
+const CRICBUZZ_PLAYER_BIO_PATH = String(
+  process.env.CRICBUZZ_PLAYER_BIO_PATH || 'stats/v1/player/{playerId}/bio'
+).trim();
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 50;
@@ -16,10 +38,22 @@ const CACHE_TTL = {
   scorecard: 60 * 60 * 1000,
   schedule: 15 * 60 * 1000,
   series: 30 * 60 * 1000,
-  seriesInfo: 15 * 60 * 1000
+  seriesInfo: 15 * 60 * 1000,
+  cricbuzzSearch: 15 * 60 * 1000,
+  cricbuzzPlayerStats: 15 * 60 * 1000,
+  cricbuzzPlayerBio: 60 * 60 * 1000
 };
 
 const responseCache = new Map();
+
+function logCricbuzzDebug(message = '', payload = null) {
+  if (String(process.env.NODE_ENV || '').trim() === 'production') return;
+  if (payload === null || payload === undefined) {
+    console.log(`[cricbuzz] ${message}`);
+    return;
+  }
+  console.log(`[cricbuzz] ${message}`, payload);
+}
 
 class CricApiError extends Error {
   constructor(message, statusCode = 502, details = {}) {
@@ -37,6 +71,25 @@ class CricApiConfigError extends CricApiError {
       source: 'external'
     });
     this.name = 'CricApiConfigError';
+  }
+}
+
+class CricbuzzApiError extends Error {
+  constructor(message, statusCode = 502, details = {}) {
+    super(message);
+    this.name = 'CricbuzzApiError';
+    this.statusCode = statusCode;
+    this.details = details;
+  }
+}
+
+class CricbuzzApiConfigError extends CricbuzzApiError {
+  constructor(message = 'Cricbuzz RapidAPI key is not configured.') {
+    super(message, 503, {
+      provider: 'cricbuzz',
+      source: 'external'
+    });
+    this.name = 'CricbuzzApiConfigError';
   }
 }
 
@@ -68,6 +121,25 @@ function buildUrl(pathname, params = {}) {
   }
 
   return url;
+}
+
+function buildCricbuzzUrl(pathname, params = {}) {
+  const base = String(CRICBUZZ_BASE_URL || `https://${CRICBUZZ_RAPIDAPI_HOST}/`).replace(/\/+$/, '/');
+  const url = new URL(String(pathname || '').replace(/^\/+/, ''), base);
+
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null || value === '') continue;
+    url.searchParams.set(key, String(value));
+  }
+
+  return url;
+}
+
+function replacePathTokens(pathname = '', replacements = {}) {
+  return String(pathname || '').replace(/\{([^}]+)\}/g, (_, token) => {
+    const value = replacements[token];
+    return value === undefined || value === null ? '' : encodeURIComponent(String(value));
+  });
 }
 
 function getCachedValue(key) {
@@ -104,6 +176,16 @@ function buildMeta(info = {}, extras = {}) {
       Number.isFinite(hitsToday) && Number.isFinite(hitsLimit) ? Math.max(0, hitsLimit - hitsToday) : null,
     ...extras
   };
+}
+
+function stringifyUpstreamPayload(payload) {
+  if (payload === undefined || payload === null) return '';
+  if (typeof payload === 'string') return payload;
+  try {
+    return JSON.stringify(payload);
+  } catch (_) {
+    return String(payload);
+  }
 }
 
 async function requestCricApi(pathname, params = {}, { cacheKey, ttlMs = 0 } = {}) {
@@ -163,6 +245,226 @@ async function requestCricApi(pathname, params = {}, { cacheKey, ttlMs = 0 } = {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function requestCricbuzz(pathname, params = {}, { cacheKey, ttlMs = 0 } = {}) {
+  if (!CRICBUZZ_ENABLED) {
+    throw new CricbuzzApiConfigError('Cricbuzz enrichment is disabled by configuration.');
+  }
+
+  if (!CRICBUZZ_RAPIDAPI_KEY) {
+    throw new CricbuzzApiConfigError();
+  }
+
+  const cached = cacheKey ? getCachedValue(cacheKey) : null;
+  if (cached) return cached;
+
+  try {
+    const rapidApiKey = String(process.env.CRICBUZZ_RAPIDAPI_KEY || CRICBUZZ_RAPIDAPI_KEY).trim();
+    const rapidApiHost = String(process.env.CRICBUZZ_RAPIDAPI_HOST || CRICBUZZ_RAPIDAPI_HOST).trim();
+    const response = await axios.get(buildCricbuzzUrl(pathname, params).toString(), {
+      headers: {
+        'X-RapidAPI-Key': rapidApiKey,
+        'X-RapidAPI-Host': rapidApiHost
+      },
+      timeout: CRICBUZZ_TIMEOUT_MS,
+      validateStatus: () => true
+    });
+    logCricbuzzDebug('API response status', {
+      status: response.status,
+      path: pathname
+    });
+
+    if (response.status < 200 || response.status >= 300) {
+      const payloadText = stringifyUpstreamPayload(response.data);
+      const normalizedPayloadText = normalizeText(payloadText);
+      const subscriptionRequired =
+        response.status === 403 &&
+        (normalizedPayloadText.includes('not subscribed') || normalizedPayloadText.includes('subscription'));
+      throw new CricbuzzApiError(
+        subscriptionRequired
+          ? 'Cricbuzz subscription unavailable for this endpoint.'
+          : `Cricbuzz request failed (${response.status}).${payloadText ? ` ${payloadText}` : ''}`,
+        subscriptionRequired ? 503 : 502,
+        {
+          provider: 'cricbuzz',
+          source: 'external',
+          upstream_status: response.status,
+          subscription_required: subscriptionRequired,
+          upstream_message: payloadText
+        }
+      );
+    }
+
+    let payload = response.data;
+    if (typeof payload === 'string') {
+      try {
+        payload = payload ? JSON.parse(payload) : {};
+      } catch (_) {
+        throw new CricbuzzApiError('Cricbuzz returned invalid JSON.', 502, {
+          provider: 'cricbuzz',
+          source: 'external'
+        });
+      }
+    }
+    if (!payload || typeof payload !== 'object') {
+      throw new CricbuzzApiError('Cricbuzz returned invalid JSON.', 502, {
+        provider: 'cricbuzz',
+        source: 'external'
+      });
+    }
+
+    setCachedValue(cacheKey, payload, ttlMs);
+    return payload;
+  } catch (error) {
+    if (axios.isAxiosError(error) && error.code === 'ECONNABORTED') {
+      throw new CricbuzzApiError('Cricbuzz request timed out.', 504, {
+        provider: 'cricbuzz',
+        source: 'external'
+      });
+    }
+    if (error instanceof CricbuzzApiError) throw error;
+    throw new CricbuzzApiError(error.message || 'Failed to reach Cricbuzz.', 502, {
+      provider: 'cricbuzz',
+      source: 'external'
+    });
+  }
+}
+
+function toArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function flattenNestedArrayCandidates(payload = {}) {
+  const directCandidates = [
+    payload?.data,
+    payload?.player,
+    payload?.players,
+    payload?.playerList,
+    payload?.player_list,
+    payload?.results,
+    payload?.items
+  ];
+  for (const candidate of directCandidates) {
+    if (Array.isArray(candidate)) return candidate;
+  }
+  for (const candidate of directCandidates) {
+    if (candidate && typeof candidate === 'object') {
+      const firstArray = Object.values(candidate).find((value) => Array.isArray(value));
+      if (Array.isArray(firstArray)) return firstArray;
+    }
+  }
+  return [];
+}
+
+function unwrapNestedEntity(value = {}) {
+  if (value && typeof value === 'object') {
+    if (value.player && typeof value.player === 'object') return value.player;
+    if (value.data && typeof value.data === 'object' && !Array.isArray(value.data)) return value.data;
+  }
+  return value && typeof value === 'object' ? value : {};
+}
+
+function maybeNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function firstNonEmptyString(...values) {
+  for (const value of values) {
+    const clean = String(value || '').trim();
+    if (clean) return clean;
+  }
+  return '';
+}
+
+function normalizeCricbuzzSearchItem(item = {}) {
+  const source = unwrapNestedEntity(item);
+  return {
+    source: 'cricbuzz',
+    id: firstNonEmptyString(source.id, source.playerId, source.pid),
+    name: firstNonEmptyString(source.name, source.fullName, source.playerName, source.nickName),
+    team: firstNonEmptyString(source.teamName, source.team, source.intlTeam, source.domesticTeam),
+    country: firstNonEmptyString(source.country, source.countryName, source.intlTeam),
+    role: firstNonEmptyString(source.role, source.playingRole),
+    batting_style: firstNonEmptyString(source.battingStyle, source.batStyle),
+    bowling_style: firstNonEmptyString(source.bowlingStyle, source.bowlStyle),
+    image_url: firstNonEmptyString(source.imageUrl, source.image_url),
+    raw: source
+  };
+}
+
+function extractCareerSections(payload = {}) {
+  const root = unwrapNestedEntity(payload);
+  return toArray(root.career || root.stats || root.values || root.records || payload.career || payload.stats);
+}
+
+function buildStatsFromEntries(entries = []) {
+  const stats = {};
+  const statLabels = {
+    matches: ['matches', 'mat'],
+    innings: ['innings', 'inns', 'inn'],
+    runs: ['runs'],
+    average: ['average', 'avg'],
+    strike_rate: ['strike rate', 'strike_rate', 'sr'],
+    high_score: ['high score', 'highest score', 'hs'],
+    wickets: ['wickets', 'wkts'],
+    economy: ['economy', 'econ', 'eco'],
+    best_bowling: ['best bowling', 'best bowling innings', 'bbi']
+  };
+
+  for (const entry of entries) {
+    const label = normalizeText(
+      firstNonEmptyString(entry.label, entry.name, entry.title, entry.stat, entry.type)
+    );
+    const value = entry.value ?? entry.val ?? entry.text ?? entry.number;
+    if (!label || value === undefined || value === null || value === '') continue;
+
+    for (const [targetKey, aliases] of Object.entries(statLabels)) {
+      if (aliases.some((alias) => label === alias || label.includes(alias))) {
+        stats[targetKey] = maybeNumber(value) ?? String(value).trim();
+        break;
+      }
+    }
+  }
+
+  return stats;
+}
+
+function normalizeCricbuzzPlayerProfile({ searchItem = {}, statsPayload = {}, bioPayload = {} } = {}) {
+  const search = normalizeCricbuzzSearchItem(searchItem);
+  const statsRoot = unwrapNestedEntity(statsPayload);
+  const bioRoot = unwrapNestedEntity(bioPayload);
+  const statsEntries = [
+    ...extractCareerSections(statsPayload),
+    ...toArray(statsRoot.headers).flatMap((header) => toArray(header.values)),
+    ...toArray(statsRoot.values),
+    ...toArray(bioRoot.values)
+  ].filter((entry) => entry && typeof entry === 'object');
+  const stats = buildStatsFromEntries(statsEntries);
+
+  return {
+    source: 'cricbuzz',
+    id: firstNonEmptyString(search.id, statsRoot.id, statsRoot.playerId, bioRoot.id),
+    name: firstNonEmptyString(search.name, statsRoot.name, statsRoot.playerName, bioRoot.name),
+    team: firstNonEmptyString(search.team, statsRoot.teamName, bioRoot.teamName),
+    country: firstNonEmptyString(search.country, statsRoot.country, bioRoot.country),
+    role: firstNonEmptyString(search.role, statsRoot.role, bioRoot.role, bioRoot.playingRole),
+    batting_style: firstNonEmptyString(search.batting_style, statsRoot.batStyle, bioRoot.batStyle, bioRoot.battingStyle),
+    bowling_style: firstNonEmptyString(search.bowling_style, statsRoot.bowlStyle, bioRoot.bowlStyle, bioRoot.bowlingStyle),
+    image_url: firstNonEmptyString(search.image_url, statsRoot.imageUrl, bioRoot.imageUrl),
+    bio: firstNonEmptyString(
+      bioRoot.bio,
+      bioRoot.description,
+      bioRoot.doB ? `Born ${bioRoot.doB}` : '',
+      bioRoot.birthPlace ? `Birthplace: ${bioRoot.birthPlace}` : ''
+    ),
+    stats,
+    raw: {
+      stats: statsPayload,
+      bio: bioPayload
+    }
+  };
 }
 
 function normalizeScoreLine(score = {}) {
@@ -577,9 +879,123 @@ async function getSeriesInfo(seriesId = '') {
   };
 }
 
+async function searchCricbuzzPlayers({ q = '', limit = DEFAULT_LIMIT } = {}) {
+  const query = String(q || '').trim();
+  if (!query) {
+    throw new CricbuzzApiError('Query parameter "q" is required.', 400, {
+      provider: 'cricbuzz',
+      source: 'external'
+    });
+  }
+
+  const safeLimit = toPositiveInteger(limit, DEFAULT_LIMIT);
+  const payload = await requestCricbuzz(
+    CRICBUZZ_SEARCH_PATH,
+    { q: query },
+    {
+      cacheKey: `cricbuzz:search:${normalizeText(query)}:${safeLimit}`,
+      ttlMs: CACHE_TTL.cricbuzzSearch
+    }
+  );
+
+  const ranked = flattenNestedArrayCandidates(payload)
+    .map(normalizeCricbuzzSearchItem)
+    .filter((item) => item.id || item.name)
+    .sort((left, right) => {
+      const leftScore = similarityScore(normalizeText(query), normalizeText(left.name || ''));
+      const rightScore = similarityScore(normalizeText(query), normalizeText(right.name || ''));
+      return rightScore - leftScore || String(left.name || '').localeCompare(String(right.name || ''));
+    });
+
+  return {
+    provider: 'cricbuzz',
+    source: 'external',
+    query,
+    items: ranked.slice(0, safeLimit),
+    raw: payload
+  };
+}
+
+async function getCricbuzzPlayerStats(playerId = '') {
+  const id = String(playerId || '').trim();
+  if (!id) {
+    throw new CricbuzzApiError('Player id is required.', 400, {
+      provider: 'cricbuzz',
+      source: 'external'
+    });
+  }
+
+  return requestCricbuzz(
+    replacePathTokens(CRICBUZZ_PLAYER_STATS_PATH, { playerId: id }),
+    {},
+    {
+      cacheKey: `cricbuzz:player-stats:${id}`,
+      ttlMs: CACHE_TTL.cricbuzzPlayerStats
+    }
+  );
+}
+
+async function getCricbuzzPlayerBio(playerId = '') {
+  const id = String(playerId || '').trim();
+  if (!id) {
+    throw new CricbuzzApiError('Player id is required.', 400, {
+      provider: 'cricbuzz',
+      source: 'external'
+    });
+  }
+
+  return requestCricbuzz(
+    replacePathTokens(CRICBUZZ_PLAYER_BIO_PATH, { playerId: id }),
+    {},
+    {
+      cacheKey: `cricbuzz:player-bio:${id}`,
+      ttlMs: CACHE_TTL.cricbuzzPlayerBio
+    }
+  );
+}
+
+async function getCricbuzzPlayerCardByName(name = '') {
+  const query = String(name || '').trim();
+  if (!query) {
+    throw new CricbuzzApiError('Player name is required.', 400, {
+      provider: 'cricbuzz',
+      source: 'external'
+    });
+  }
+
+  const searchResult = await searchCricbuzzPlayers({ q: query, limit: 3 });
+  const topPlayer = searchResult.items[0];
+  if (!topPlayer) {
+    return {
+      provider: 'cricbuzz',
+      source: 'external',
+      query,
+      player: null
+    };
+  }
+
+  const [statsPayload, bioPayload] = await Promise.all([
+    getCricbuzzPlayerStats(topPlayer.id).catch(() => ({})),
+    getCricbuzzPlayerBio(topPlayer.id).catch(() => ({}))
+  ]);
+
+  return {
+    provider: 'cricbuzz',
+    source: 'external',
+    query,
+    player: normalizeCricbuzzPlayerProfile({
+      searchItem: topPlayer,
+      statsPayload,
+      bioPayload
+    })
+  };
+}
+
 module.exports = {
   CricApiError,
   CricApiConfigError,
+  CricbuzzApiError,
+  CricbuzzApiConfigError,
   toBoolean,
   toPositiveInteger,
   getLiveScores,
@@ -588,5 +1004,9 @@ module.exports = {
   getMatchScorecard,
   getMatchSchedule,
   getSeriesList,
-  getSeriesInfo
+  getSeriesInfo,
+  searchCricbuzzPlayers,
+  getCricbuzzPlayerStats,
+  getCricbuzzPlayerBio,
+  getCricbuzzPlayerCardByName
 };

@@ -1,0 +1,46 @@
+[
+  {
+    "id": "history_cricket_origin",
+    "category": "history",
+    "sub_intent": "history_trivia",
+    "title": "Cricket History",
+    "aliases": ["cricket history", "history of cricket", "when cricket started"],
+    "keywords": ["origin", "england", "history"],
+    "answer": "Cricket developed in England and by the 18th century had become the country's national summer sport. It later spread through the British Empire and grew into a major international game played across Asia, Oceania, Africa, Europe, and the Caribbean.",
+    "examples": ["Tell me cricket history"],
+    "related_topics": ["World Cup winners", "legendary players"]
+  },
+  {
+    "id": "history_india_pakistan_rivalry",
+    "category": "history",
+    "sub_intent": "history_trivia",
+    "title": "India vs Pakistan Rivalry",
+    "aliases": ["india pakistan rivalry", "famous cricket rivalry", "biggest cricket rivalry"],
+    "keywords": ["india", "pakistan", "rivalry", "history"],
+    "answer": "India vs Pakistan is widely regarded as cricket's biggest rivalry because of the sporting stakes, history, fan intensity, and repeated high-pressure ICC encounters. The rivalry carries far more emotional weight than a normal bilateral series.",
+    "examples": ["Tell me about India vs Pakistan rivalry"],
+    "related_topics": ["World Cup winners", "famous matches"]
+  },
+  {
+    "id": "history_legendary_players",
+    "category": "history",
+    "sub_intent": "history_trivia",
+    "title": "Legendary Players",
+    "aliases": ["legendary players", "greatest cricket players", "best cricket legends"],
+    "keywords": ["sachin", "bradman", "viv richards", "muralitharan"],
+    "answer": "A short list of all-time cricket legends usually includes Don Bradman, Sachin Tendulkar, Viv Richards, Jacques Kallis, Shane Warne, Muttiah Muralitharan, Wasim Akram, and MS Dhoni. The exact order depends on the format and the criteria being used.",
+    "examples": ["Who are the legendary cricket players?"],
+    "related_topics": ["Cricket history", "records"]
+  },
+  {
+    "id": "history_famous_match_2019_final",
+    "category": "history",
+    "sub_intent": "history_trivia",
+    "title": "2019 World Cup Final",
+    "aliases": ["famous match", "2019 world cup final", "england new zealand super over"],
+    "keywords": ["super over", "world cup final", "tie"],
+    "answer": "One of cricket's most famous matches is the 2019 Men's World Cup final between England and New Zealand at Lord's. The match ended tied, the Super Over ended tied, and England were awarded the title on the boundary-count rule that was in place at the time.",
+    "examples": ["Tell me a famous cricket match"],
+    "related_topics": ["World Cup winners", "cricket history"]
+  }
+]

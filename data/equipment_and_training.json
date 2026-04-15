@@ -1,0 +1,68 @@
+[
+  {
+    "id": "equipment_cricket_bat",
+    "category": "equipment",
+    "sub_intent": "equipment_info",
+    "title": "Cricket Bat Basics",
+    "aliases": ["cricket bat", "bat information", "best cricket bat basics"],
+    "keywords": ["willow", "weight", "pickup", "bat"],
+    "answer": "A cricket bat is usually made from willow. The key selection factors are pickup, weight balance, handle feel, and whether the blade shape suits front-foot or back-foot play. For most players, a bat that feels easy to control matters more than the heaviest possible bat.",
+    "examples": ["Tell me about cricket bat selection"],
+    "related_topics": ["protective equipment", "batting drills"]
+  },
+  {
+    "id": "equipment_protection",
+    "category": "equipment",
+    "sub_intent": "equipment_info",
+    "title": "Protective Equipment",
+    "aliases": ["cricket equipment", "protective gear", "what equipment is used in cricket"],
+    "keywords": ["helmet", "pads", "gloves", "guard"],
+    "answer": "Basic batting protection includes a helmet, batting pads, gloves, thigh guard, inner gloves, and an abdominal guard. Wicketkeepers use specialized gloves and pads, and close fielders may use helmets or shin guards depending on the situation.",
+    "examples": ["What equipment is used in cricket?"],
+    "related_topics": ["cricket bat", "fielding drills"]
+  },
+  {
+    "id": "training_batting_drills",
+    "category": "training",
+    "sub_intent": "coaching_drill",
+    "title": "Batting Drills",
+    "aliases": ["batting drill", "batting drills", "batting practice routine"],
+    "keywords": ["throwdowns", "shadow batting", "front foot", "back foot"],
+    "answer": "Good batting practice usually includes shadow batting, throwdowns, front-foot and back-foot movement drills, and controlled net sessions with a clear scoring zone target. Short, high-focus sessions work better than long unstructured hitting.",
+    "examples": ["Give me batting practice drills"],
+    "related_topics": ["practice routine", "cricket bat"]
+  },
+  {
+    "id": "training_bowling_drills",
+    "category": "training",
+    "sub_intent": "coaching_drill",
+    "title": "Bowling Drills",
+    "aliases": ["bowling drill", "bowling drills", "bowling practice"],
+    "keywords": ["run-up", "seam", "yorker", "target bowling"],
+    "answer": "Useful bowling drills include run-up rhythm checks, seam-position repetition, yorker target practice, slower-ball variations, and six-ball over plans. The best bowling practice is repeatable and target-based rather than just bowling fast.",
+    "examples": ["Give me bowling drills"],
+    "related_topics": ["yorker", "practice routine"]
+  },
+  {
+    "id": "training_fielding_drills",
+    "category": "training",
+    "sub_intent": "coaching_drill",
+    "title": "Fielding Drills",
+    "aliases": ["fielding drills", "fielding practice"],
+    "keywords": ["catching", "ground fielding", "throwing"],
+    "answer": "Effective fielding sessions combine high catches, slip-catching reaction work, one-hand pick-up and release drills, and direct-hit practice. Quality matters more than volume because fielding is about speed, clean technique, and repeatable execution.",
+    "examples": ["How do I practice fielding in cricket?"],
+    "related_topics": ["practice routine", "protective equipment"]
+  },
+  {
+    "id": "training_practice_routine",
+    "category": "training",
+    "sub_intent": "coaching_drill",
+    "title": "Practice Routine",
+    "aliases": ["practice routine", "cricket practice routine", "coaching drills"],
+    "keywords": ["warm-up", "nets", "skills", "recovery"],
+    "answer": "A solid cricket practice routine usually has four parts: warm-up and mobility, one skill block such as batting or bowling, one fielding block, and a short match-scenario block. Finishing with recovery and notes helps keep improvement measurable.",
+    "examples": ["Give me a cricket practice routine"],
+    "related_topics": ["batting drills", "bowling drills", "fielding drills"]
+  }
+]

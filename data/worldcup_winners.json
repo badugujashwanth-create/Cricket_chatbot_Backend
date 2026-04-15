@@ -1,0 +1,57 @@
+[
+  {
+    "id": "wc_2011",
+    "category": "worldcup",
+    "sub_intent": "worldcup_history",
+    "title": "2011 Cricket World Cup",
+    "aliases": ["who won wc 2011", "who won world cup 2011", "2011 world cup winner"],
+    "keywords": ["india", "world cup", "2011", "dhoni"],
+    "answer": "India won the 2011 Men's Cricket World Cup by beating Sri Lanka in the final at Wankhede Stadium, Mumbai.",
+    "examples": ["Who won WC 2011?"],
+    "related_topics": ["World Cup winners", "MS Dhoni"]
+  },
+  {
+    "id": "wc_2015",
+    "category": "worldcup",
+    "sub_intent": "worldcup_history",
+    "title": "2015 Cricket World Cup",
+    "aliases": ["who won wc 2015", "2015 world cup winner"],
+    "keywords": ["australia", "world cup", "2015"],
+    "answer": "Australia won the 2015 Men's Cricket World Cup by beating New Zealand in the final at Melbourne.",
+    "examples": ["Who won WC 2015?"],
+    "related_topics": ["World Cup winners"]
+  },
+  {
+    "id": "wc_2019",
+    "category": "worldcup",
+    "sub_intent": "worldcup_history",
+    "title": "2019 Cricket World Cup",
+    "aliases": ["who won wc 2019", "2019 world cup winner"],
+    "keywords": ["england", "2019", "super over"],
+    "answer": "England won the 2019 Men's Cricket World Cup after a tied final and tied Super Over against New Zealand at Lord's.",
+    "examples": ["Who won WC 2019?"],
+    "related_topics": ["2019 World Cup final"]
+  },
+  {
+    "id": "wc_2023",
+    "category": "worldcup",
+    "sub_intent": "worldcup_history",
+    "title": "2023 Cricket World Cup",
+    "aliases": ["who won wc 2023", "2023 world cup winner"],
+    "keywords": ["australia", "2023", "india"],
+    "answer": "Australia won the 2023 Men's Cricket World Cup by beating India in the final at Ahmedabad.",
+    "examples": ["Who won WC 2023?"],
+    "related_topics": ["World Cup winners"]
+  },
+  {
+    "id": "t20_wc_2007",
+    "category": "worldcup",
+    "sub_intent": "worldcup_history",
+    "title": "2007 T20 World Cup",
+    "aliases": ["who won t20 world cup 2007", "t20 wc 2007 winner"],
+    "keywords": ["india", "t20", "2007"],
+    "answer": "India won the inaugural 2007 ICC Men's T20 World Cup by beating Pakistan in the final at Johannesburg.",
+    "examples": ["Who won T20 World Cup 2007?"],
+    "related_topics": ["World Cup winners"]
+  }
+]

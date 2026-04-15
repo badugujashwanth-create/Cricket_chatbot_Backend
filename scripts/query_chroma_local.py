@@ -55,12 +55,14 @@ def main() -> int:
     distances = (result.get('distances') or [[]])[0]
 
     for idx, doc_id in enumerate(ids):
+        full_document = docs[idx] if idx < len(docs) else ''
         rows.append(
             {
                 'id': doc_id,
                 'distance': distances[idx] if idx < len(distances) else None,
                 'metadata': metas[idx] if idx < len(metas) else {},
-                'document_preview': (docs[idx] if idx < len(docs) else '')[:500],
+                'document': full_document,
+                'document_preview': full_document[:500],
             }
         )
 

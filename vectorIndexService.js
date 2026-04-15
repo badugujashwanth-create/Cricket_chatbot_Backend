@@ -1,6 +1,11 @@
 const { getCollectionDocs, queryVectorDb } = require('./chromaService');
 const { normalizeText, similarityScore, tokenize } = require('./textUtils');
 const { buildPlayerAliases, getCanonicalPlayerName } = require('./playerMaster');
+const {
+  mergePlayerWithSql,
+  mergeTeamWithSql,
+  getTopPlayersByMetricFromSql
+} = require('./sqlStatsService');
 
 const INDEX_TTL_MS = 10 * 60 * 1000;
 const PLAYER_LIMIT = 20000;
@@ -12,6 +17,12 @@ const cacheState = {
   teams: { expiresAt: 0, items: [] },
   matches: { expiresAt: 0, items: [] }
 };
+
+function clearVectorIndexCache() {
+  cacheState.players = { expiresAt: 0, items: [] };
+  cacheState.teams = { expiresAt: 0, items: [] };
+  cacheState.matches = { expiresAt: 0, items: [] };
+}
 
 function titleCaseMetric(metric = '') {
   return String(metric || '')
@@ -42,52 +53,68 @@ function parseString(text = '', pattern) {
   return match ? String(match[1] || '').trim() : '';
 }
 
-function parsePlayerProfile(row = {}) {
+function parsePlayerProfile(row = {}, { mergeSql = true } = {}) {
   const document = String(row.document || '');
   const metadata = row.metadata && typeof row.metadata === 'object' ? row.metadata : {};
   const playerName =
     String(metadata.player || '').trim() ||
     parseString(document, /Cricket player profile\s+(.+?)\./i);
 
-  return {
+  const player = {
     id: String(row.id || '').trim(),
     type: 'player_profile',
     name: playerName,
     canonical_name: getCanonicalPlayerName(playerName) || playerName,
     team: String(metadata.team || '').trim(),
     role: String(metadata.role || '').trim(),
-    matches: Number(metadata.matches || 0),
-    runs: Number(metadata.runs || 0),
-    wickets: Number(metadata.wickets || 0),
-    average: parseNumber(document, /batting average\s+([0-9.]+)/i),
-    strike_rate: Number(metadata.strike_rate || 0),
-    economy: Number(metadata.economy || 0),
-    fours: parseNumber(document, /Fours\s+([0-9,]+)/i),
-    sixes: parseNumber(document, /sixes\s+([0-9,]+)/i),
+    matches: Number(metadata.matches || parseNumber(document, /Indexed matches\s+([0-9,]+)/i)),
+    runs: Number(metadata.runs || parseNumber(document, /\bRuns\s+([0-9,]+)/i)),
+    wickets: Number(metadata.wickets || parseNumber(document, /\bwickets\s+([0-9,]+)/i)),
+    average: Number(metadata.average || parseNumber(document, /batting average\s+([0-9.]+)/i)),
+    strike_rate: Number(metadata.strike_rate || parseNumber(document, /strike rate\s+([0-9.]+)/i)),
+    economy: Number(metadata.economy || parseNumber(document, /bowling economy\s+([0-9.]+)/i)),
+    fours: Number(metadata.fours || parseNumber(document, /Fours\s+([0-9,]+)/i)),
+    sixes: Number(metadata.sixes || parseNumber(document, /sixes\s+([0-9,]+)/i)),
+    is_active: Boolean(metadata.is_active),
+    source: String(metadata.source || 'vector').trim() || 'vector',
     document
   };
+
+  return mergeSql ? mergePlayerWithSql(player) : player;
 }
 
-function parseTeamSummary(row = {}) {
+function parseTeamSummary(row = {}, { mergeSql = true } = {}) {
   const document = String(row.document || '');
   const metadata = row.metadata && typeof row.metadata === 'object' ? row.metadata : {};
   const teamName =
     String(metadata.team || '').trim() ||
     parseString(document, /Cricket team summary for\s+(.+?)\./i);
 
-  return {
+  const team = {
     id: String(row.id || '').trim(),
     type: 'team_summary',
     name: teamName,
-    matches: Number(metadata.matches || 0),
-    wins: Number(metadata.wins || 0),
-    win_rate: Number(metadata.win_rate || 0),
-    losses: parseNumber(document, /losses\s+([0-9,]+)/i),
-    no_result: parseNumber(document, /no result\s+([0-9,]+)/i),
-    runs: parseNumber(document, /Total batting runs\s+([0-9,]+)/i),
-    strike_rate: parseNumber(document, /team strike rate\s+([0-9.]+)/i),
+    matches: Number(metadata.matches || parseNumber(document, /Indexed matches\s+([0-9,]+)/i)),
+    wins: Number(metadata.wins || parseNumber(document, /\bwins\s+([0-9,]+)/i)),
+    win_rate: Number(metadata.win_rate || parseNumber(document, /win rate\s+([0-9.]+)/i)),
+    losses: Number(metadata.losses || parseNumber(document, /losses\s+([0-9,]+)/i)),
+    no_result: Number(metadata.no_result || parseNumber(document, /no result\s+([0-9,]+)/i)),
+    runs: Number(metadata.runs || parseNumber(document, /Total batting runs\s+([0-9,]+)/i)),
+    average_score: Number(
+      metadata.average_score ||
+        (Number(metadata.matches || parseNumber(document, /Indexed matches\s+([0-9,]+)/i)) > 0
+          ? (
+              Number(metadata.runs || parseNumber(document, /Total batting runs\s+([0-9,]+)/i)) /
+              Number(metadata.matches || parseNumber(document, /Indexed matches\s+([0-9,]+)/i))
+            ).toFixed(2)
+          : 0)
+    ),
+    strike_rate: Number(metadata.strike_rate || parseNumber(document, /team strike rate\s+([0-9.]+)/i)),
+    source: String(metadata.source || 'vector').trim() || 'vector',
     document
   };
+
+  return mergeSql ? mergeTeamWithSql(team) : team;
 }
 
 function parseMatchSummary(row = {}) {
@@ -132,6 +159,13 @@ async function loadPlayerProfiles(force = false) {
   return setCache('players', items);
 }
 
+async function loadArchivePlayerProfiles() {
+  const payload = await getCollectionDocs({ doc_type: 'player_profile' }, { limit: PLAYER_LIMIT });
+  return (payload.docs || [])
+    .map((row) => parsePlayerProfile(row, { mergeSql: false }))
+    .filter((item) => item.name);
+}
+
 async function loadTeamSummaries(force = false) {
   if (!force && isFresh(cacheState.teams)) return cacheState.teams.items;
   const payload = await getCollectionDocs({ doc_type: 'team_summary' }, { limit: TEAM_LIMIT });
@@ -139,6 +173,13 @@ async function loadTeamSummaries(force = false) {
     .map(parseTeamSummary)
     .filter((item) => item.name);
   return setCache('teams', items);
+}
+
+async function loadArchiveTeamSummaries() {
+  const payload = await getCollectionDocs({ doc_type: 'team_summary' }, { limit: TEAM_LIMIT });
+  return (payload.docs || [])
+    .map((row) => parseTeamSummary(row, { mergeSql: false }))
+    .filter((item) => item.name);
 }
 
 async function loadMatchSummaries(force = false) {
@@ -298,26 +339,7 @@ async function getTeamById(id = '') {
 }
 
 async function getTopPlayersByMetric(metric = 'runs', { limit = 10 } = {}) {
-  const players = await loadPlayerProfiles();
-  const key = String(metric || '').trim();
-  const ranked = [...players]
-    .sort((left, right) => Number(right[key] || 0) - Number(left[key] || 0) || right.matches - left.matches)
-    .slice(0, Math.max(1, Number(limit) || 10))
-    .map((player, index) => ({
-      rank: index + 1,
-      player: player.canonical_name || player.name,
-      team: player.team,
-      value: Number(player[key] || 0),
-      matches: player.matches,
-      runs: player.runs,
-      average: player.average,
-      strike_rate: player.strike_rate,
-      wickets: player.wickets,
-      sixes: player.sixes,
-      fours: player.fours
-    }));
-
-  return ranked;
+  return getTopPlayersByMetricFromSql(metric, { limit });
 }
 
 async function getTopPlayersForTeam(teamName = '', metric = 'runs', { limit = 10 } = {}) {
@@ -399,6 +421,9 @@ async function findRelevantVectorContext(query = '', limit = 5) {
 module.exports = {
   formatNumber,
   titleCaseMetric,
+  clearVectorIndexCache,
+  loadArchivePlayerProfiles,
+  loadArchiveTeamSummaries,
   loadPlayerProfiles,
   loadTeamSummaries,
   loadMatchSummaries,

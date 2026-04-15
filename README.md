@@ -6,11 +6,13 @@ Express backend for the Cricket Chat Bot application. It serves the frontend, an
 
 - Serves the static frontend from `../frontend`
 - Loads player, team, and match summaries from the local Chroma vector archive
+- Rebuilds archive stats into a local SQLite database before publishing semantic profiles to Chroma
 - Exposes archive search endpoints for players, teams, matches, and summaries
 - Accepts natural-language cricket questions through `/api/query`
 - Streams query progress and results through Server-Sent Events
 - Pulls live scores, schedules, series, and player details from CricAPI
 - Enriches player cards with profile metadata such as country, image, and Wikipedia links
+- Syncs completed live matches into SQLite first, then refreshes the affected Chroma player, team, and match docs
 
 ## Key Files
 
@@ -21,6 +23,8 @@ Express backend for the Cricket Chat Bot application. It serves the frontend, an
 - `cricApiService.js`: live CricAPI integration, normalization, and caching
 - `playerProfileService.js`: player enrichment and profile lookup
 - `vectorIndexService.js`: Chroma-backed player, team, and match indexing helpers
+- `workers/dailyIngestor.js`: completed-match sync worker that updates SQLite and Chroma
+- `scripts/sql_vector_pipeline.py`: SQLite-first ETL and live SQL-to-vector sync entry point
 - `scripts/`: dataset rebuild, vector build, and verification scripts
 
 ## Requirements
@@ -200,6 +204,7 @@ npm run test:name-resolution
 npm run dataset:clean
 npm run chroma:build
 npm run rebuild:all
+npm run archive:rebuild
 npm run chroma:query
 ```
 
@@ -210,8 +215,9 @@ npm run chroma:query
 - `npm run test:cricapi`: exercises live provider integration
 - `npm run test:name-resolution`: validates name matching and entity resolution
 - `npm run dataset:clean`: rebuilds the cleaned local dataset
-- `npm run chroma:build`: rebuilds the cleaned dataset and local Chroma index
-- `npm run rebuild:all`: alias for a full dataset and Chroma rebuild
+- `npm run chroma:build`: runs the SQLite-first ETL and rebuilds Chroma from the SQL archive
+- `npm run rebuild:all`: alias for the full SQLite and Chroma rebuild
+- `npm run archive:rebuild`: explicit entry point for the SQLite-first ETL pipeline
 - `npm run chroma:query`: queries the local vector store helper
 
 ## Dataset and Generated Artifacts
@@ -220,6 +226,8 @@ Local rebuild scripts generate large artifacts that are intentionally ignored by
 
 - `cleaned_balls_all_matches.csv`
 - `cleaned_dataset_manifest.json`
+- `cricket_archive.sqlite3`
+- `sqlite_manifest.json`
 - `chroma_db/`
 - `chroma_manifest.json`
 
@@ -229,6 +237,8 @@ Those files should be rebuilt locally when needed instead of committed.
 
 - The first warm-up can take time because the archive is indexed in memory.
 - Archive-backed endpoints wait for readiness, but live CricAPI endpoints are available independently.
+- The full rebuild path is now SQLite-first: cleaned CSV -> SQLite aggregates -> Chroma semantic docs.
+- The daily ingestor updates SQLite first and then refreshes only the affected Chroma docs.
 - The backend assumes the frontend directory exists one level above this repo.
 - `.env`, `node_modules`, generated dataset files, logs, and local vector artifacts are excluded from git.
 

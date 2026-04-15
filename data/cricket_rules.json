@@ -1,0 +1,68 @@
+[
+  {
+    "id": "rule_lbw",
+    "category": "rules",
+    "sub_intent": "rules_explainer",
+    "title": "LBW",
+    "aliases": ["lbw", "leg before wicket", "what is lbw"],
+    "keywords": ["pad", "stumps", "out", "leg before"],
+    "answer": "LBW means Leg Before Wicket. A batter can be out if the ball hits the pad or body first and the umpire believes the ball would have gone on to hit the stumps, subject to line, impact, and shot-offered rules.",
+    "examples": ["What is LBW in cricket?", "Explain leg before wicket"],
+    "related_topics": ["DRS", "umpire signals", "no ball"]
+  },
+  {
+    "id": "rule_powerplay",
+    "category": "rules",
+    "sub_intent": "rules_explainer",
+    "title": "Powerplay",
+    "aliases": ["powerplay", "power play", "powerplay overs"],
+    "keywords": ["fielding restriction", "circle", "overs"],
+    "answer": "Powerplay is the fielding-restriction phase in limited-overs cricket. During that phase, only a limited number of fielders are allowed outside the 30-yard circle, which usually makes aggressive batting easier.",
+    "examples": ["What is powerplay?", "How many powerplay overs are there?"],
+    "related_topics": ["fielding restrictions", "free hit", "ODI vs T20"]
+  },
+  {
+    "id": "rule_free_hit",
+    "category": "rules",
+    "sub_intent": "rules_explainer",
+    "title": "Free Hit",
+    "aliases": ["free hit", "what is free hit", "freehit"],
+    "keywords": ["no ball", "dismissal", "next ball"],
+    "answer": "A free hit is awarded for the delivery after a front-foot no-ball in limited-overs cricket. On a free hit, the batter cannot be dismissed in most normal ways such as bowled, caught, LBW, or stumped unless it is a run out, hit the ball twice, or obstructing the field.",
+    "examples": ["What is free hit in cricket?"],
+    "related_topics": ["no ball", "powerplay", "wide ball"]
+  },
+  {
+    "id": "rule_no_ball",
+    "category": "rules",
+    "sub_intent": "rules_explainer",
+    "title": "No-Ball",
+    "aliases": ["no ball", "noball", "what is no ball"],
+    "keywords": ["front foot", "illegal delivery", "extra run"],
+    "answer": "A no-ball is an illegal delivery. Common reasons include overstepping the front crease, bowling above waist height on the full, or certain fielding violations. The batting side gets one extra run and the ball usually does not count in the over.",
+    "examples": ["Explain no-ball", "What is a no ball?"],
+    "related_topics": ["free hit", "wide ball", "umpire signals"]
+  },
+  {
+    "id": "rule_drs",
+    "category": "rules",
+    "sub_intent": "rules_explainer",
+    "title": "DRS",
+    "aliases": ["drs", "decision review system", "why drs is used"],
+    "keywords": ["review", "technology", "umpire", "hawkeye"],
+    "answer": "DRS stands for Decision Review System. It allows players to challenge some umpiring decisions using technology such as ball tracking, UltraEdge, and slow-motion replays. It is mainly used to reduce clear errors on LBW, caught-behind, and similar decisions.",
+    "examples": ["What is DRS?", "Why is DRS used in cricket?"],
+    "related_topics": ["LBW", "umpire signals"]
+  },
+  {
+    "id": "rule_umpire_signals",
+    "category": "rules",
+    "sub_intent": "rules_explainer",
+    "title": "Umpire Signals",
+    "aliases": ["umpire signals", "cricket umpire signals", "signals in cricket"],
+    "keywords": ["signal", "four", "six", "out", "wide"],
+    "answer": "Common umpire signals include one arm raised sideways for a no-ball, both arms stretched sideways for a wide, one arm waved across the chest for a four, both arms raised for a six, and an index finger raised for out. These signals communicate the decision clearly to players, scorers, and broadcasters.",
+    "examples": ["What are umpire signals in cricket?"],
+    "related_topics": ["no ball", "wide ball", "LBW"]
+  }
+]

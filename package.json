@@ -8,12 +8,18 @@
     "test:cases": "node scripts/test-cases.js",
     "test:cricapi": "node scripts/test-cricapi.js",
     "dataset:clean": "python scripts/build_clean_dataset.py",
-    "chroma:build": "python scripts/build_clean_dataset.py && python scripts/build_chroma_local.py --reset",
-    "rebuild:all": "python scripts/build_clean_dataset.py && python scripts/build_chroma_local.py --reset",
+    "chroma:build": "python scripts/build_chroma_local.py --reset",
+    "rebuild:all": "python scripts/build_chroma_local.py --reset",
+    "archive:rebuild": "python scripts/sql_vector_pipeline.py rebuild --reset",
     "chroma:query": "python scripts/query_chroma_local.py"
   },
   "dependencies": {
+    "axios": "^1.14.0",
+    "better-sqlite3": "^12.8.0",
+    "chromadb": "^3.4.3",
     "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "espn-cricket-api": "^1.0.4",
+    "express": "^4.19.2",
+    "socket.io": "^4.8.3"
   }
 }

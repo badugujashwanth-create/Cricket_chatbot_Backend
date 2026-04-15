@@ -74,9 +74,11 @@ function markProviderSuccess(provider) {
 }
 
 function providerOrder({ provider = 'auto', purpose = 'general' } = {}) {
+  // PRIORITIZE LOCAL LLM - keep costs at zero
   if (provider === 'local') return hasLocalLlm() && providerReady('local') ? ['local'] : [];
   if (provider === 'openai') return hasOpenAiLlm() && providerReady('openai') ? ['openai'] : [];
 
+  // For routing and synthesis, try local first, then cloud
   if (purpose === 'router') {
     return [
       hasLocalLlm() && providerReady('local') ? 'local' : '',

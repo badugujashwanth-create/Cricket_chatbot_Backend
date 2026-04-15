@@ -3,6 +3,8 @@ node_modules/
 .env
 chroma_db/
 chroma_manifest.json
+cricket_archive.sqlite3
+sqlite_manifest.json
 cleaned_balls_all_matches.csv
 cleaned_dataset_manifest.json
 __pycache__/

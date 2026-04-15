@@ -1,27 +1,41 @@
 require('../loadEnv');
 
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
 const { execFile } = require('child_process');
+const path = require('path');
 const { promisify } = require('util');
 
 const { getLiveScores, getMatchScorecard } = require('../cricApiService');
 const { callLlama } = require('../llamaClient');
-const { slugify } = require('../textUtils');
+const {
+  clearVectorQueryCache,
+  clearCollectionCache,
+  hasMatchDocument,
+  upsertDocuments
+} = require('../chromaService');
+const { clearVectorIndexCache } = require('../vectorIndexService');
+const {
+  recordCompletedMatch,
+  getPlayerByIdFromSql,
+  getTeamByIdFromSql,
+  getMatchByIdFromSql,
+  extractPlayerDeltasFromMatch,
+  extractTeamTotalsFromMatch
+} = require('../sqlStatsService');
 
 const execFileAsync = promisify(execFile);
 
 const BACKEND_DIR = path.join(__dirname, '..');
-const CHROMA_ADMIN_SCRIPT = path.join(BACKEND_DIR, 'scripts', 'chroma_collection_local.py');
 const PYTHON_BIN = process.env.PYTHON_BIN || 'python';
+const SCRAPER_SCRIPT = path.join(BACKEND_DIR, 'scripts', 'scrape_match.py');
 const CHROMA_COLLECTION = process.env.CHROMA_COLLECTION || 'cricket_semantic_index';
-const DEFAULT_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_INTERVAL_MS = Math.max(60_000, Number(process.env.INGEST_INTERVAL_MS || 60_000));
 const MATCH_LOOKBACK_HOURS = Number(process.env.INGEST_LOOKBACK_HOURS || 24);
 const DEFAULT_MATCH_LIMIT = Math.max(1, Number(process.env.INGEST_MATCH_LIMIT || 10));
 
 let ingestorTimer = null;
 let activeRun = null;
+let rateLimitBackoffMs = 0;
+let rateLimitRetryCount = 0;
 
 function parseJsonText(raw = '') {
   const text = String(raw || '').trim();
@@ -47,10 +61,14 @@ function dateValue(value = '') {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function toIsoDate(value = '') {
-  const parsed = dateValue(value);
-  if (parsed === null) return String(value || '').trim();
-  return new Date(parsed).toISOString().slice(0, 10);
+function recentCompletedMatches(items = [], lookbackHours = MATCH_LOOKBACK_HOURS) {
+  const cutoff =
+    Date.now() - Math.max(1, Number(lookbackHours) || MATCH_LOOKBACK_HOURS) * 60 * 60 * 1000;
+  return (Array.isArray(items) ? items : []).filter((item) => {
+    if (!item?.match_ended) return false;
+    const timestamp = dateValue(item.date_time_gmt || item.date || '');
+    return timestamp !== null && timestamp >= cutoff;
+  });
 }
 
 function scoreLine(items = []) {
@@ -63,109 +81,15 @@ function scoreLine(items = []) {
     .join(', ');
 }
 
-function stableMatchDocId(match = {}) {
-  return `match-completed-${String(match.id || '').trim()}`;
-}
-
-function stablePlayerDocId(playerName = '') {
-  return `player-stats-${slugify(playerName || 'unknown-player')}`;
-}
-
-function buildTempInputPath(prefix = 'chroma-admin') {
-  return path.join(
-    os.tmpdir(),
-    `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`
-  );
-}
-
-async function writeTempJson(prefix = 'chroma-admin', payload = {}) {
-  const filePath = buildTempInputPath(prefix);
-  await fs.promises.writeFile(filePath, JSON.stringify(payload), 'utf8');
-  return filePath;
-}
-
-async function chromaGet(where = {}, limit = 1, collection = CHROMA_COLLECTION) {
-  const { stdout } = await execFileAsync(
-    PYTHON_BIN,
-    [
-      CHROMA_ADMIN_SCRIPT,
-      'get',
-      '--collection',
-      collection,
-      '--where-json',
-      JSON.stringify(where),
-      '--limit',
-      String(Math.max(1, Number(limit) || 1))
-    ],
-    {
-      cwd: BACKEND_DIR,
-      timeout: 30000,
-      maxBuffer: 8 * 1024 * 1024
-    }
-  );
-
-  const payload = parseJsonText(stdout) || {};
-  const ids = Array.isArray(payload.ids) ? payload.ids : [];
-  const documents = Array.isArray(payload.documents) ? payload.documents : [];
-  const metadatas = Array.isArray(payload.metadatas) ? payload.metadatas : [];
-  return ids.map((id, index) => ({
-    id,
-    document: documents[index] || '',
-    metadata: metadatas[index] && typeof metadatas[index] === 'object' ? metadatas[index] : {}
-  }));
-}
-
-async function chromaUpsert(documents = [], collection = CHROMA_COLLECTION) {
-  if (!Array.isArray(documents) || !documents.length) {
-    return {
-      ok: true,
-      count: 0
-    };
-  }
-
-  const inputPath = await writeTempJson('chroma-upsert', { documents });
-  try {
-    const { stdout } = await execFileAsync(
-      PYTHON_BIN,
-      [
-        CHROMA_ADMIN_SCRIPT,
-        'upsert',
-        '--collection',
-        collection,
-        '--input',
-        inputPath
-      ],
-      {
-        cwd: BACKEND_DIR,
-        timeout: 60000,
-        maxBuffer: 8 * 1024 * 1024
-      }
-    );
-
-    return parseJsonText(stdout) || { ok: false, count: 0 };
-  } finally {
-    fs.promises.unlink(inputPath).catch(() => {});
-  }
-}
-
-function recentCompletedMatches(items = [], lookbackHours = MATCH_LOOKBACK_HOURS) {
-  const cutoff = Date.now() - Math.max(1, Number(lookbackHours) || MATCH_LOOKBACK_HOURS) * 60 * 60 * 1000;
-  return (Array.isArray(items) ? items : []).filter((item) => {
-    if (!item?.match_ended) return false;
-    const timestamp = dateValue(item.date_time_gmt || item.date || '');
-    return timestamp !== null && timestamp >= cutoff;
-  });
-}
-
 function buildFallbackNarrative(match = {}) {
   const innings = Array.isArray(match.scorecard) ? match.scorecard : [];
   const topBatters = innings
-    .flatMap((inning) => Array.isArray(inning.batting) ? inning.batting : [])
+    .flatMap((inning) => (Array.isArray(inning.batting) ? inning.batting : []))
     .sort((left, right) => Number(right.runs || 0) - Number(left.runs || 0))
     .slice(0, 3)
     .map((row) => `${row.batsman?.name || 'Unknown'} (${row.runs || 0})`);
   const topBowlers = innings
-    .flatMap((inning) => Array.isArray(inning.bowling) ? inning.bowling : [])
+    .flatMap((inning) => (Array.isArray(inning.bowling) ? inning.bowling : []))
     .sort((left, right) => Number(right.wickets || 0) - Number(left.wickets || 0))
     .slice(0, 3)
     .map((row) => `${row.bowler?.name || 'Unknown'} (${row.wickets || 0}/${row.runs_conceded || 0})`);
@@ -209,255 +133,326 @@ async function summarizeMatchNarrative(match = {}) {
   }
 }
 
-function getOrCreatePlayerDelta(map, name = '') {
-  const cleanName = String(name || '').trim();
-  if (!cleanName) return null;
-  if (!map.has(cleanName)) {
-    map.set(cleanName, {
-      player_name: cleanName,
-      runs_added: 0,
-      wickets_added: 0,
-      appearances: 0
-    });
-  }
-  return map.get(cleanName);
+function formatNumber(value) {
+  const numeric = Number(value || 0);
+  if (!Number.isFinite(numeric)) return 0;
+  return Number.isInteger(numeric) ? numeric : Number(numeric.toFixed(2));
 }
 
-function extractPlayerDeltas(match = {}) {
-  const deltas = new Map();
-  const seenAppearance = new Set();
-  const innings = Array.isArray(match.scorecard) ? match.scorecard : [];
-
-  innings.forEach((inning) => {
-    (Array.isArray(inning.batting) ? inning.batting : []).forEach((row) => {
-      const name = String(row.batsman?.name || '').trim();
-      const delta = getOrCreatePlayerDelta(deltas, name);
-      if (!delta) return;
-      delta.runs_added += Number(row.runs || 0);
-      if (!seenAppearance.has(name)) {
-        seenAppearance.add(name);
-        delta.appearances += 1;
-      }
-    });
-
-    (Array.isArray(inning.bowling) ? inning.bowling : []).forEach((row) => {
-      const name = String(row.bowler?.name || '').trim();
-      const delta = getOrCreatePlayerDelta(deltas, name);
-      if (!delta) return;
-      delta.wickets_added += Number(row.wickets || 0);
-      if (!seenAppearance.has(name)) {
-        seenAppearance.add(name);
-        delta.appearances += 1;
-      }
-    });
-  });
-
-  return [...deltas.values()];
-}
-
-function extractStructuredStats(documentText = '') {
-  const marker = 'STRUCTURED_STATS_JSON:';
-  const index = String(documentText || '').lastIndexOf(marker);
-  if (index < 0) return null;
-  const raw = String(documentText || '').slice(index + marker.length).trim();
-  return parseJsonText(raw);
-}
-
-function normalizeRole(role = '') {
-  const clean = String(role || '').trim().toLowerCase();
-  if (!clean) return 'batter';
-  if (clean.includes('all')) return 'all-rounder';
-  if (clean.includes('bowl')) return 'bowler';
-  return 'batter';
-}
-
-function inferRole(current = {}, delta = {}) {
-  const existingRole = normalizeRole(current.role || '');
-  if (current.role) return existingRole;
-  if (Number(delta.wickets_added || 0) > 0 && Number(delta.runs_added || 0) > 0) return 'all-rounder';
-  if (Number(delta.wickets_added || 0) > 0) return 'bowler';
-  return 'batter';
-}
-
-async function readBasePlayerState(playerName = '', collection = CHROMA_COLLECTION) {
-  const currentDocs = await chromaGet(
-    {
-      doc_type: 'player_stats',
-      player_name: String(playerName || '').trim()
-    },
-    1,
-    collection
-  );
-
-  const currentDoc = currentDocs[0] || null;
-  if (currentDoc) {
-    const structured = extractStructuredStats(currentDoc.document) || {};
-    return {
-      id: currentDoc.id || stablePlayerDocId(playerName),
-      role: normalizeRole(currentDoc.metadata?.role || structured.role || ''),
-      matches: Number(structured.matches || 0),
-      runs: Number(structured.runs || 0),
-      wickets: Number(structured.wickets || 0),
-      ingested_match_ids: Array.isArray(structured.ingested_match_ids) ? structured.ingested_match_ids : [],
-      recent_updates: Array.isArray(structured.recent_updates) ? structured.recent_updates : []
-    };
-  }
-
-  const profileDocs = await chromaGet(
-    {
-      doc_type: 'player_profile',
-      player: String(playerName || '').trim()
-    },
-    1,
-    collection
-  );
-
-  const profile = profileDocs[0] || null;
+function buildPlayerDocument(player = {}) {
+  const name = String(player.name || player.canonical_name || '').trim();
   return {
-    id: stablePlayerDocId(playerName),
-    role: normalizeRole(profile?.metadata?.role || ''),
-    matches: Number(profile?.metadata?.matches || 0),
-    runs: Number(profile?.metadata?.runs || 0),
-    wickets: Number(profile?.metadata?.wickets || 0),
-    ingested_match_ids: [],
-    recent_updates: []
+    id: String(player.id || '').trim(),
+    document: `Cricket player profile ${name}. Team ${player.team || 'Unknown'}. Role ${
+      player.role || 'Cricketer'
+    }. Indexed matches ${formatNumber(player.matches)}. Runs ${formatNumber(player.runs)}, wickets ${formatNumber(
+      player.wickets
+    )}, batting average ${formatNumber(player.average)}, strike rate ${formatNumber(
+      player.strike_rate
+    )}, bowling economy ${formatNumber(player.economy)}. Fours ${formatNumber(
+      player.fours
+    )}, sixes ${formatNumber(player.sixes)}. Semantic profile tags: ${
+      player.is_active ? 'Active player, live-updated profile.' : 'Archive-backed profile.'
+    }`,
+    metadata: {
+      doc_type: 'player_profile',
+      player: name,
+      team: String(player.team || '').trim(),
+      role: String(player.role || '').trim(),
+      matches: formatNumber(player.matches),
+      runs: formatNumber(player.runs),
+      wickets: formatNumber(player.wickets),
+      average: formatNumber(player.average),
+      strike_rate: formatNumber(player.strike_rate),
+      economy: formatNumber(player.economy),
+      fours: formatNumber(player.fours),
+      sixes: formatNumber(player.sixes),
+      is_active: Boolean(player.is_active),
+      source: 'live_sync'
+    }
   };
 }
 
-function buildPlayerStatsDocument(playerName = '', role = 'batter', state = {}) {
-  const updates = (Array.isArray(state.recent_updates) ? state.recent_updates : []).slice(0, 5);
-  const lines = [
-    `Player statistics profile for ${playerName}.`,
-    `Role: ${role}.`,
-    `Matches: ${Number(state.matches || 0)}.`,
-    `Total Runs: ${Number(state.runs || 0)}.`,
-    `Total Wickets: ${Number(state.wickets || 0)}.`
-  ];
+function buildTeamDocument(team = {}) {
+  return {
+    id: String(team.id || '').trim(),
+    document: `Cricket team summary for ${team.name}. Indexed matches ${formatNumber(
+      team.matches
+    )}, wins ${formatNumber(team.wins)}, losses ${formatNumber(team.losses)}, no result ${formatNumber(
+      team.no_result
+    )}, win rate ${formatNumber(team.win_rate)} percent. Total batting runs ${formatNumber(
+      team.runs
+    )}, average score ${formatNumber(team.average_score)}, team strike rate ${formatNumber(
+      team.strike_rate
+    )}.`,
+    metadata: {
+      doc_type: 'team_summary',
+      team: String(team.name || '').trim(),
+      matches: formatNumber(team.matches),
+      wins: formatNumber(team.wins),
+      losses: formatNumber(team.losses),
+      no_result: formatNumber(team.no_result),
+      win_rate: formatNumber(team.win_rate),
+      runs: formatNumber(team.runs),
+      average_score: formatNumber(team.average_score),
+      strike_rate: formatNumber(team.strike_rate),
+      source: 'live_sync'
+    }
+  };
+}
 
-  if (updates.length) {
-    lines.push(
-      `Recent live updates: ${updates
-        .map(
-          (entry) =>
-            `${entry.date}: ${entry.match_name} (+${entry.runs_added} runs, +${entry.wickets_added} wickets)`
-        )
-        .join('; ')}.`
-    );
+function buildMatchDocument(match = {}) {
+  const teams = [String(match.team1 || '').trim(), String(match.team2 || '').trim()].filter(Boolean);
+  return {
+    id: `match:${String(match.id || '').trim()}`,
+    document: `Cricket match ${match.id} on ${match.date || 'date unavailable'} ${
+      match.match_type || ''
+    } at ${match.venue || 'venue unavailable'}. Teams: ${teams.join(' vs ') || match.name || 'Unknown'}. Winner: ${
+      match.winner || 'unknown'
+    }. Narrative: ${match.summary || 'n/a'}.`,
+    metadata: {
+      doc_type: 'match_summary',
+      match_id: String(match.id || '').trim(),
+      date: String(match.date || '').trim(),
+      match_type: String(match.match_type || '').trim(),
+      venue: String(match.venue || '').trim(),
+      winner: String(match.winner || '').trim(),
+      source: String(match.source || 'live_sync').trim() || 'live_sync'
+    }
+  };
+}
+
+function isRateLimitedError(error) {
+  const upstreamStatus = Number(error?.details?.upstream_status || error?.statusCode || 0);
+  const message = String(error?.message || '').toLowerCase();
+  return (
+    upstreamStatus === 429 ||
+    upstreamStatus === 503 ||
+    message.includes('rate limit') ||
+    message.includes('hits today exceeded') ||
+    message.includes('quota') ||
+    message.includes('too many requests') ||
+    message.includes('service unavailable')
+  );
+}
+
+async function scrapeMatchFromUrl(matchUrl = '') {
+  const cleanUrl = String(matchUrl || '').trim();
+  if (!cleanUrl) {
+    throw new Error('A scraper URL is required.');
   }
 
-  lines.push(
-    `STRUCTURED_STATS_JSON: ${JSON.stringify(
-      {
-        role,
-        matches: Number(state.matches || 0),
-        runs: Number(state.runs || 0),
-        wickets: Number(state.wickets || 0),
-        ingested_match_ids: Array.isArray(state.ingested_match_ids) ? state.ingested_match_ids : [],
-        recent_updates: updates
-      },
-      null,
-      0
-    )}`
+  const { stdout } = await execFileAsync(
+    PYTHON_BIN,
+    [SCRAPER_SCRIPT, '--url', cleanUrl],
+    {
+      cwd: BACKEND_DIR,
+      timeout: 120000,
+      maxBuffer: 8 * 1024 * 1024
+    }
   );
 
-  return lines.join(' ');
+  const payload = parseJsonText(stdout) || {};
+  const match = payload.match && typeof payload.match === 'object' ? payload.match : payload;
+  if (!match || typeof match !== 'object' || !match.id) {
+    throw new Error('Web scraper did not return a normalized match payload.');
+  }
+  return {
+    provider: 'web_scraper',
+    source: 'Web Scraper',
+    match
+  };
 }
 
-function buildMatchNarrativeDocument(match = {}, narrative = '') {
-  return [
-    `Completed match: ${match.name || 'Unknown match'}.`,
-    match.status ? `Result: ${match.status}.` : '',
-    match.venue ? `Venue: ${match.venue}.` : '',
-    match.score?.length ? `Score summary: ${scoreLine(match.score)}.` : '',
-    String(narrative || '').trim()
-  ]
+function resolveMatchUrl(matchFeedItem = {}) {
+  return String(
+    matchFeedItem.match_url ||
+      matchFeedItem.scorecard_url ||
+      matchFeedItem.url ||
+      matchFeedItem.source_url ||
+      ''
+  ).trim();
+}
+
+async function refreshVectorDocsForMatch(match = {}, syncResult = {}) {
+  const basePlayerDeltas = Array.isArray(syncResult.playerDeltas) && syncResult.playerDeltas.length
+    ? syncResult.playerDeltas
+    : extractPlayerDeltasFromMatch(match);
+  const baseTeamDeltas = Array.isArray(syncResult.teamDeltas) && syncResult.teamDeltas.length
+    ? syncResult.teamDeltas
+    : extractTeamTotalsFromMatch(match);
+
+  const playerDocs = basePlayerDeltas
+    .map((delta) => getPlayerByIdFromSql(delta.id))
     .filter(Boolean)
-    .join(' ');
-}
+    .map(buildPlayerDocument);
+  const teamDocs = baseTeamDeltas
+    .map((delta) => getTeamByIdFromSql(delta.id))
+    .filter(Boolean)
+    .map(buildTeamDocument);
+  const sqlMatch = getMatchByIdFromSql(match.id);
+  const matchDocs = sqlMatch ? [buildMatchDocument(sqlMatch)] : [];
+  const docs = [...playerDocs, ...teamDocs, ...matchDocs];
 
-async function ingestCompletedMatch(matchFeedItem = {}, playerStateCache = new Map(), collection = CHROMA_COLLECTION) {
-  const scorecardPayload = await getMatchScorecard(matchFeedItem.id);
-  const match = scorecardPayload.match || {};
-  const narrative = await summarizeMatchNarrative(match);
-  const docs = [
-    {
-      id: stableMatchDocId(match),
-      document: buildMatchNarrativeDocument(match, narrative),
-      metadata: {
-        doc_type: 'match',
-        status: 'completed',
-        date: toIsoDate(match.date_time_gmt || match.date || '')
-      }
-    }
-  ];
-
-  const deltas = extractPlayerDeltas(match);
-  for (const delta of deltas) {
-    const cached = playerStateCache.get(delta.player_name);
-    const baseState = cached || (await readBasePlayerState(delta.player_name, collection));
-    if (Array.isArray(baseState.ingested_match_ids) && baseState.ingested_match_ids.includes(match.id)) {
-      continue;
-    }
-
-    const nextRole = inferRole(baseState, delta);
-    const recentUpdates = [
-      {
-        match_id: match.id,
-        date: toIsoDate(match.date_time_gmt || match.date || ''),
-        match_name: match.name || 'Completed match',
-        runs_added: Number(delta.runs_added || 0),
-        wickets_added: Number(delta.wickets_added || 0)
-      },
-      ...(Array.isArray(baseState.recent_updates) ? baseState.recent_updates : [])
-    ].slice(0, 10);
-
-    const nextState = {
-      id: baseState.id || stablePlayerDocId(delta.player_name),
-      role: nextRole,
-      matches: Number(baseState.matches || 0) + Number(delta.appearances || 0),
-      runs: Number(baseState.runs || 0) + Number(delta.runs_added || 0),
-      wickets: Number(baseState.wickets || 0) + Number(delta.wickets_added || 0),
-      ingested_match_ids: [
-        ...(Array.isArray(baseState.ingested_match_ids) ? baseState.ingested_match_ids : []),
-        match.id
-      ].slice(-40),
-      recent_updates: recentUpdates
-    };
-
-    playerStateCache.set(delta.player_name, nextState);
-    docs.push({
-      id: nextState.id,
-      document: buildPlayerStatsDocument(delta.player_name, nextRole, nextState),
-      metadata: {
-        doc_type: 'player_stats',
-        player_name: delta.player_name,
-        role: nextRole
-      }
-    });
+  if (docs.length) {
+    await upsertDocuments(docs, { collection: CHROMA_COLLECTION });
+    clearVectorIndexCache();
+    clearVectorQueryCache();
+    clearCollectionCache();
   }
 
-  await chromaUpsert(docs, collection);
   return {
-    match_id: match.id,
-    narrative_saved: true,
-    player_documents: docs.length - 1
+    player_documents: playerDocs.length,
+    team_documents: teamDocs.length,
+    match_documents: matchDocs.length
+  };
+}
+
+async function runLiveSqlVectorSync(match = {}, narrative = '', sourceLabel = 'CricAPI') {
+  const syncResult = recordCompletedMatch(match, { narrative: narrative || buildFallbackNarrative(match) });
+  const docCounts = await refreshVectorDocsForMatch(match, syncResult);
+
+  return {
+    match_id: String(match.id || '').trim(),
+    narrative_saved: Boolean(syncResult.applied || syncResult.reason === 'already_synced'),
+    updated_existing: Boolean(syncResult.reason === 'already_synced'),
+    source: sourceLabel,
+    summary: String(syncResult.summary || '').trim(),
+    ...docCounts
+  };
+}
+
+async function ensureMatchIndexed(
+  { matchId = '', matchUrl = '', matchFeedItem = null, force = false } = {},
+  { collection = CHROMA_COLLECTION } = {}
+) {
+  const cleanMatchId = String(matchId || matchFeedItem?.id || '').trim();
+  const cleanMatchUrl = String(matchUrl || resolveMatchUrl(matchFeedItem || {})).trim();
+
+  if (!force && cleanMatchId && (await hasMatchDocument(cleanMatchId, { collection }))) {
+    return {
+      skipped: true,
+      reason: 'already_indexed',
+      match_id: cleanMatchId,
+      source: 'Vector Archive'
+    };
+  }
+
+  let provider = 'CricAPI';
+  let matchPayload = null;
+  try {
+    if (!cleanMatchId) {
+      throw new Error('A match id is required for CricAPI lookup.');
+    }
+    const scorecardPayload = await getMatchScorecard(cleanMatchId);
+    matchPayload = scorecardPayload.match || null;
+  } catch (error) {
+    if (!isRateLimitedError(error) || !cleanMatchUrl) {
+      throw error;
+    }
+    provider = 'Web Scraper';
+    const scraped = await scrapeMatchFromUrl(cleanMatchUrl);
+    matchPayload = scraped.match;
+  }
+
+  if (!matchPayload?.id) {
+    throw new Error('Match payload was empty after live fetch.');
+  }
+
+  const narrative = await summarizeMatchNarrative(matchPayload);
+  return runLiveSqlVectorSync(matchPayload, narrative, provider);
+}
+
+async function ingestCompletedMatch(matchFeedItem = {}, collection = CHROMA_COLLECTION) {
+  const result = await ensureMatchIndexed(
+    {
+      matchId: matchFeedItem.id,
+      matchUrl: resolveMatchUrl(matchFeedItem),
+      matchFeedItem
+    },
+    { collection }
+  );
+
+  if (result.skipped) {
+    return result;
+  }
+
+  return result;
+}
+
+function buildLiveAlertPayload(match = {}) {
+  return {
+    type: 'live_snapshot',
+    match_id: String(match.id || '').trim(),
+    title: String(match.name || 'Live Match Alert').trim(),
+    summary: [String(match.status || '').trim(), scoreLine(match.score || [])].filter(Boolean).join(' | '),
+    teams: Array.isArray(match.teams) ? match.teams : [],
+    status: String(match.status || '').trim(),
+    score: Array.isArray(match.score) ? match.score : []
   };
 }
 
 async function runDailyIngestorOnce({
   lookbackHours = MATCH_LOOKBACK_HOURS,
   maxMatches = DEFAULT_MATCH_LIMIT,
-  collection = CHROMA_COLLECTION
+  collection = CHROMA_COLLECTION,
+  onEvent = null
 } = {}) {
   if (activeRun) return activeRun;
 
   activeRun = (async () => {
-    const liveResult = await getLiveScores({
-      includeRecent: true,
-      limit: Math.max(10, Number(maxMatches || DEFAULT_MATCH_LIMIT) * 3)
-    });
+    // Check if we should skip due to rate limiting
+    if (rateLimitBackoffMs > 0) {
+      const now = Date.now();
+      const timeSinceLastCheck = now - (activeRun?.lastRateLimitCheck || 0);
+      if (timeSinceLastCheck < rateLimitBackoffMs) {
+        return {
+          ran: false,
+          skipped: true,
+          reason: 'rate_limited',
+          retry_after_ms: Math.max(0, rateLimitBackoffMs - timeSinceLastCheck),
+          message: `Backing off due to rate limit. Retry after ${Math.ceil((rateLimitBackoffMs - timeSinceLastCheck) / 1000)}s.`
+        };
+      }
+      rateLimitBackoffMs = 0;
+      rateLimitRetryCount = 0;
+    }
 
-    const completed = recentCompletedMatches(liveResult.items || [], lookbackHours).slice(
+    let liveResult;
+    try {
+      liveResult = await getLiveScores({
+        includeRecent: true,
+        limit: Math.max(10, Number(maxMatches || DEFAULT_MATCH_LIMIT) * 3)
+      });
+    } catch (error) {
+      if (isRateLimitedError(error)) {
+        // Exponential backoff: 5s, 10s, 20s, 40s, 80s, max 5 minutes
+        rateLimitRetryCount++;
+        rateLimitBackoffMs = Math.min(
+          300_000, // 5 minutes max
+          Math.pow(2, Math.min(rateLimitRetryCount - 1, 4)) * 5_000 // 5s * 2^n
+        );
+        console.warn(
+          `[daily-ingestor] rate limited. Retrying in ${Math.ceil(rateLimitBackoffMs / 1000)}s (attempt ${rateLimitRetryCount})`
+        );
+        return {
+          ran: false,
+          skipped: true,
+          reason: 'rate_limited',
+          retry_after_ms: rateLimitBackoffMs,
+          message: `CricAPI rate limit hit. Will retry in ${Math.ceil(rateLimitBackoffMs / 1000)}s.`
+        };
+      }
+      throw error;
+    }
+
+    const liveItems = Array.isArray(liveResult.items) ? liveResult.items : [];
+    const activeLiveMatch = liveItems.find((item) => item.live) || liveItems[0] || null;
+    if (activeLiveMatch && typeof onEvent === 'function') {
+      onEvent(buildLiveAlertPayload(activeLiveMatch));
+    }
+
+    const completed = recentCompletedMatches(liveItems, lookbackHours).slice(
       0,
       Math.max(1, Number(maxMatches) || DEFAULT_MATCH_LIMIT)
     );
@@ -470,11 +465,20 @@ async function runDailyIngestorOnce({
       };
     }
 
-    const playerStateCache = new Map();
     const results = [];
     for (const match of completed) {
       try {
-        results.push(await ingestCompletedMatch(match, playerStateCache, collection));
+        const result = await ingestCompletedMatch(match, collection);
+        results.push(result);
+        if (!result.skipped && typeof onEvent === 'function') {
+          onEvent({
+            type: 'match_ingested',
+            match_id: result.match_id,
+            title: 'Archive Sync Complete',
+            summary: `${result.match_id} synced from ${result.source}.`,
+            source: result.source
+          });
+        }
       } catch (error) {
         results.push({
           match_id: String(match.id || ''),
@@ -499,7 +503,8 @@ async function runDailyIngestorOnce({
 
 function startDailyIngestor({
   intervalMs = DEFAULT_INTERVAL_MS,
-  runOnStart = String(process.env.RUN_DAILY_INGESTOR_ON_BOOT || '').trim().toLowerCase() === 'true'
+  runOnStart = String(process.env.RUN_DAILY_INGESTOR_ON_BOOT || 'true').trim().toLowerCase() === 'true',
+  io = null
 } = {}) {
   if (String(process.env.ENABLE_DAILY_INGESTOR || 'true').trim().toLowerCase() === 'false') {
     return null;
@@ -507,8 +512,13 @@ function startDailyIngestor({
 
   if (ingestorTimer) return ingestorTimer;
 
+  const emitEvent = (payload) => {
+    if (!io) return;
+    io.emit('live-score-alert', payload);
+  };
+
   ingestorTimer = setInterval(() => {
-    runDailyIngestorOnce().catch((error) => {
+    runDailyIngestorOnce({ onEvent: emitEvent }).catch((error) => {
       console.error('[daily-ingestor] run failed:', error?.message || error);
     });
   }, Math.max(60_000, Number(intervalMs) || DEFAULT_INTERVAL_MS));
@@ -516,7 +526,7 @@ function startDailyIngestor({
   ingestorTimer.unref?.();
 
   if (runOnStart) {
-    runDailyIngestorOnce().catch((error) => {
+    runDailyIngestorOnce({ onEvent: emitEvent }).catch((error) => {
       console.error('[daily-ingestor] initial run failed:', error?.message || error);
     });
   }
@@ -533,5 +543,6 @@ function stopDailyIngestor() {
 module.exports = {
   startDailyIngestor,
   stopDailyIngestor,
-  runDailyIngestorOnce
+  runDailyIngestorOnce,
+  ensureMatchIndexed
 };

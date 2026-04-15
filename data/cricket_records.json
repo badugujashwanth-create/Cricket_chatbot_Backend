@@ -1,0 +1,57 @@
+[
+  {
+    "id": "record_highest_odi_score",
+    "category": "records",
+    "sub_intent": "record_lookup",
+    "title": "Highest Individual Score in ODI",
+    "aliases": ["highest individual score in odi", "highest score in odi", "odi highest score"],
+    "keywords": ["rohit sharma", "264", "eden gardens"],
+    "answer": "The men's ODI highest individual score is 264, made by Rohit Sharma against Sri Lanka at Eden Gardens on 13 November 2014.",
+    "examples": ["Highest individual score in ODI"],
+    "related_topics": ["fastest century in ODI", "best bowling figures in ODI"]
+  },
+  {
+    "id": "record_fastest_odi_century",
+    "category": "records",
+    "sub_intent": "record_lookup",
+    "title": "Fastest Century in ODI",
+    "aliases": ["fastest century in odi", "fastest odi hundred", "odi fastest 100"],
+    "keywords": ["ab de villiers", "31 balls"],
+    "answer": "The men's ODI fastest-century record belongs to AB de Villiers, who reached 100 in 31 balls against West Indies in Johannesburg on 18 January 2015.",
+    "examples": ["Who has the fastest century in ODI?"],
+    "related_topics": ["highest individual score in ODI"]
+  },
+  {
+    "id": "record_best_odi_bowling",
+    "category": "records",
+    "sub_intent": "record_lookup",
+    "title": "Best Bowling Figures in ODI",
+    "aliases": ["best bowling figures in odi", "best bowling in odi", "odi best bowling"],
+    "keywords": ["chaminda vaas", "8/19"],
+    "answer": "The best bowling figures in a men's ODI innings are 8 for 19 by Chaminda Vaas against Zimbabwe in Colombo in December 2001.",
+    "examples": ["Best bowling figures in ODI"],
+    "related_topics": ["most wickets", "hat-trick"]
+  },
+  {
+    "id": "record_longest_six",
+    "category": "records",
+    "sub_intent": "history_trivia",
+    "title": "Longest Six",
+    "aliases": ["longest six", "biggest six in cricket", "who hit the longest six"],
+    "keywords": ["shahid afridi", "158 metres", "unofficial"],
+    "answer": "The longest six in cricket is commonly credited to Shahid Afridi at around 158 metres, although long-distance six measurements are not standardized across all eras and broadcasts.",
+    "examples": ["Who hit the longest six in cricket?"],
+    "related_topics": ["power hitters", "most sixes"]
+  },
+  {
+    "id": "record_fastest_t20i_century",
+    "category": "records",
+    "sub_intent": "record_lookup",
+    "title": "Fastest T20I Century",
+    "aliases": ["fastest century in t20", "fastest century in t20i", "t20i fastest 100"],
+    "keywords": ["sahil chauhan", "27 balls"],
+    "answer": "The men's T20I fastest-century record is 27 balls, made by Sahil Chauhan against Cyprus on 17 June 2024.",
+    "examples": ["Fastest T20I century"],
+    "related_topics": ["fastest century in ODI"]
+  }
+]

@@ -1,0 +1,79 @@
+[
+  {
+    "id": "term_yorker",
+    "category": "terminology",
+    "sub_intent": "terminology_explainer",
+    "title": "Yorker",
+    "aliases": ["yorker", "what is yorker", "yorker ball"],
+    "keywords": ["full length", "toe-crushing", "death overs"],
+    "answer": "A yorker is a very full delivery that lands at or near the batter's feet or the base of the stumps. It is hard to score from cleanly and is one of the most effective balls in death overs.",
+    "examples": ["What is yorker ball?"],
+    "related_topics": ["googly", "doosra", "death bowling"]
+  },
+  {
+    "id": "term_googly",
+    "category": "terminology",
+    "sub_intent": "terminology_explainer",
+    "title": "Googly",
+    "aliases": ["googly", "what is googly"],
+    "keywords": ["leg spin", "wrong one", "turn"],
+    "answer": "A googly is the leg-spinner's wrong'un. It looks like a normal leg-break out of the hand, but it turns the other way after pitching.",
+    "examples": ["Explain googly in cricket"],
+    "related_topics": ["doosra", "leg spin"]
+  },
+  {
+    "id": "term_doosra",
+    "category": "terminology",
+    "sub_intent": "terminology_explainer",
+    "title": "Doosra",
+    "aliases": ["doosra", "what is doosra"],
+    "keywords": ["off spin", "other one", "turn"],
+    "answer": "A doosra is an off-spinner's variation that turns away from a right-handed batter instead of turning in like a normal off-break. It is designed to surprise the batter by changing the expected direction of spin.",
+    "examples": ["Explain doosra"],
+    "related_topics": ["googly", "off spin"]
+  },
+  {
+    "id": "term_maiden_over",
+    "category": "terminology",
+    "sub_intent": "terminology_explainer",
+    "title": "Maiden Over",
+    "aliases": ["maiden over", "what is maiden over"],
+    "keywords": ["no runs", "dot balls", "bowling"],
+    "answer": "A maiden over is an over in which the bowler concedes no runs off the bat or extras. It shows tight, disciplined bowling pressure.",
+    "examples": ["What is a maiden over?"],
+    "related_topics": ["economy", "hat-trick"]
+  },
+  {
+    "id": "term_hat_trick",
+    "category": "terminology",
+    "sub_intent": "terminology_explainer",
+    "title": "Hat-Trick",
+    "aliases": ["hat-trick", "hat trick", "what is hat trick"],
+    "keywords": ["three wickets", "consecutive balls"],
+    "answer": "A hat-trick happens when a bowler takes three wickets with three consecutive legal deliveries. Those balls can span two overs if the bowler finishes one over and starts the next.",
+    "examples": ["What is a hat-trick in cricket?"],
+    "related_topics": ["maiden over", "best bowling figures"]
+  },
+  {
+    "id": "format_test_odi_t20",
+    "category": "formats",
+    "sub_intent": "format_comparison",
+    "title": "Test vs ODI vs T20",
+    "aliases": ["difference between odi and t20", "test vs odi vs t20", "odi vs t20", "test vs t20", "format difference"],
+    "keywords": ["overs", "days", "format", "comparison"],
+    "answer": "Test cricket is the longest format and can last up to five days with two innings per side. ODIs are 50 overs per side and usually finish in one day. T20 matches are 20 overs per side and are designed to be the shortest and fastest-scoring international format.",
+    "examples": ["Difference between ODI and T20", "Test vs ODI vs T20"],
+    "related_topics": ["powerplay", "fielding restrictions", "overs breakdown"]
+  },
+  {
+    "id": "format_overs_breakdown",
+    "category": "formats",
+    "sub_intent": "format_comparison",
+    "title": "Overs Breakdown",
+    "aliases": ["overs breakdown", "how many overs in odi", "how many overs in t20", "overs in each format"],
+    "keywords": ["overs", "odi", "t20", "test"],
+    "answer": "A T20 innings is 20 overs. An ODI innings is 50 overs. Test cricket does not have a fixed overs cap per innings, although each day has a target overs quota for the fielding side.",
+    "examples": ["What is powerplay overs?", "How many overs are in ODI?"],
+    "related_topics": ["Test vs ODI vs T20", "powerplay"]
+  }
+]
