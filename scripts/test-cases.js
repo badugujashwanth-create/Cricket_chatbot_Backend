@@ -3,6 +3,7 @@ require('../loadEnv');
 const { routeQuestion } = require('../llamaRouter');
 const { processQuery } = require('../queryService');
 const { queryVectorDb } = require('../chromaService');
+const { loadMatchSummaries, findMatchesForTeam, getMatchById } = require('../vectorIndexService');
 
 function assert(condition, message) {
   if (!condition) {
@@ -173,6 +174,16 @@ async function main() {
   });
   assert(degradedVector && degradedVector.available === false, 'missing Chroma path should degrade cleanly');
   assert(typeof degradedVector.warning === 'string' && degradedVector.warning.trim(), 'missing Chroma path should return a warning');
+
+  const matchSummaries = await loadMatchSummaries(true);
+  assert(Array.isArray(matchSummaries) && matchSummaries.length > 0, 'archive match summaries should be available');
+  assert(matchSummaries[0] && matchSummaries[0].id, 'archive match summary should include an id');
+
+  const teamMatches = await findMatchesForTeam('India', { limit: 3 });
+  assert(Array.isArray(teamMatches) && teamMatches.length > 0, 'team match lookup should return archived matches');
+
+  const matchDetails = await getMatchById(matchSummaries[0].id);
+  assert(matchDetails && matchDetails.id === matchSummaries[0].id, 'match lookup by id should resolve archived matches');
 
   console.log('Smoke coverage passed.');
 }

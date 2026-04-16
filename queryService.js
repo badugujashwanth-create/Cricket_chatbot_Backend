@@ -3984,12 +3984,39 @@ async function canonicalizeLeaderboardRows(rows = []) {
 
 async function buildSubjectiveAnalysisAnswer(question = '', route = {}, structuredContext = {}, vectorContext = {}, cricApiContext = {}) {
   const { playerHints, teamHints } = deriveEntityHints(question, route);
-  const subject = pickFirst(structuredContext?.result?.data?.subject, playerHints[0], teamHints[0], 'this debate');
+  const normalizedQuestion = normalizeText(question);
+  const isPredictionQuestion =
+    /\bwho\s+(?:may|might|will|can|could|should)\s+win\b|\blikely winner\b|\bwin probability\b|\bpredict(?:ion)?\b/.test(
+      normalizedQuestion
+    );
+  const isFantasyQuestion = /\b(fantasy|dream11|captain|vice captain|\bvc\b)\b/.test(normalizedQuestion);
+  const activeLiveItem = Array.isArray(cricApiContext?.live_scores)
+    ? cricApiContext.live_scores.find((item) => item?.live) || null
+    : null;
+  const contextualLiveItem =
+    activeLiveItem ||
+    cricApiContext?.schedule?.[0] ||
+    cricApiContext?.live_scores?.[0] ||
+    cricApiContext?.archive_recent_matches?.[0] ||
+    null;
+  const useStructuredSubject =
+    Boolean(playerHints[0] || teamHints[0]) ||
+    !(isPredictionQuestion || isFantasyQuestion || /\b(today|tonight|current|upcoming|next)\b/.test(normalizedQuestion));
+  const explicitSubject = pickFirst(
+    playerHints[0],
+    teamHints[0],
+    useStructuredSubject ? structuredContext?.result?.data?.subject : ''
+  );
+  const subject = pickFirst(
+    explicitSubject,
+    contextualLiveItem?.name,
+    /\b(today|tonight|current|upcoming|next)\b/.test(normalizedQuestion) ? "today's match" : '',
+    'this debate'
+  );
   const evidence = [];
   const structuredAnswer = String(structuredContext?.result?.answer || '').trim();
   const vectorPreview = String(vectorContext?.results?.[0]?.document_preview || '').trim();
-  const liveItem = cricApiContext?.live_scores?.[0] || cricApiContext?.schedule?.[0] || null;
-  const normalizedQuestion = normalizeText(question);
+  const liveItem = contextualLiveItem;
 
   if (structuredAnswer && structuredAnswer !== NOT_AVAILABLE_MESSAGE) {
     evidence.push(`Verified archive context: ${structuredAnswer}`);
@@ -4025,8 +4052,28 @@ async function buildSubjectiveAnalysisAnswer(question = '', route = {}, structur
     }
   }
 
-  if (/\bwho will win\b|\bpredict(?:ion)?\b/.test(normalizedQuestion)) {
+  if (isPredictionQuestion) {
     const base = `Cricket is unpredictable, so there is no guaranteed winner for ${subject}.`;
+    if (liveItem?.name) {
+      const liveContextLine = activeLiveItem?.live
+        ? `The live match context right now is ${liveItem.name}${liveItem.status ? ` (${liveItem.status})` : ''}.`
+        : `The nearest match context I can verify right now is ${liveItem.name}${liveItem.status ? ` (${liveItem.status})` : ''}.`;
+      const guidance = activeLiveItem?.live
+        ? 'Use the current score, wickets in hand, and remaining overs before making a pick.'
+        : 'Use confirmed lineups, recent form, and head-to-head record before making a pick.';
+      if (evidence.length) {
+        return {
+          answer: `${base}\n\n${liveContextLine} ${guidance}\n\nThe most useful signals I can ground right now are:\n- ${evidence.join('\n- ')}`,
+          followups: ['Compare two teams', 'Show recent live scores', 'Show team head to head'],
+          sources: buildSourceList(structuredContext, vectorContext, cricApiContext)
+        };
+      }
+      return {
+        answer: `${base}\n\n${liveContextLine} ${guidance}`,
+        followups: ['Compare two teams', 'Show recent live scores', 'Show team head to head'],
+        sources: buildSourceList(structuredContext, vectorContext, cricApiContext)
+      };
+    }
     if (evidence.length) {
       return {
         answer: `${base}\n\nThe most useful signals I can ground right now are:\n- ${evidence.join('\n- ')}`,
@@ -4037,6 +4084,21 @@ async function buildSubjectiveAnalysisAnswer(question = '', route = {}, structur
     return {
       answer: `${base} The safest way to judge it is to compare recent form, head-to-head record, and lineup strength for the teams you care about.`,
       followups: ['Compare two teams', 'Show recent live scores', 'Show upcoming matches'],
+      sources: buildSourceList(structuredContext, vectorContext, cricApiContext)
+    };
+  }
+
+  if (isFantasyQuestion) {
+    if (liveItem?.name) {
+      return {
+        answer: `There is no single guaranteed fantasy captain for ${subject}. The nearest grounded match context I can verify right now is ${liveItem.name}${liveItem.status ? ` (${liveItem.status})` : ''}. The safest captain profile is usually a top-order batter or all-rounder with full batting and bowling involvement once the confirmed XIs are available.`,
+        followups: ['Show live scores', 'Show upcoming matches', 'Compare two players'],
+        sources: buildSourceList(structuredContext, vectorContext, cricApiContext)
+      };
+    }
+    return {
+      answer: `There is no single guaranteed fantasy captain for ${subject}. The safest pick is usually a top-order batter or all-rounder with maximum role security once the confirmed XI is available.`,
+      followups: ['Show live scores', 'Show upcoming matches', 'Compare two players'],
       sources: buildSourceList(structuredContext, vectorContext, cricApiContext)
     };
   }

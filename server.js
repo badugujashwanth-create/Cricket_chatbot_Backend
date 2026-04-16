@@ -714,13 +714,21 @@ app.get('/api/cricbuzz/player-card', async (req, res) => {
       }
     });
   } catch (error) {
-    if (error?.details?.subscription_required || /not subscribed/i.test(String(error?.message || ''))) {
-      const query = String(req.query.name || req.query.q || '').trim();
+    const query = String(req.query.name || req.query.q || '').trim();
+    if (query) {
       const fallback = await buildFallbackPlayerCard(query);
       if (fallback?.player) {
+        let fallbackReason = 'cricbuzz_unavailable';
+        if (error?.details?.subscription_required || /not subscribed/i.test(String(error?.message || ''))) {
+          fallbackReason = 'cricbuzz_subscription_unavailable';
+        } else if (error?.name === 'CricbuzzApiConfigError') {
+          fallbackReason = 'cricbuzz_disabled_or_unconfigured';
+        } else if (Number(error?.statusCode || 500) === 404) {
+          fallbackReason = 'no_cricbuzz_match';
+        }
         return res.json({
           ...fallback,
-          fallback_reason: 'cricbuzz_subscription_unavailable'
+          fallback_reason: fallbackReason
         });
       }
     }

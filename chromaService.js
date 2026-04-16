@@ -21,6 +21,7 @@ const DEFAULT_SEMANTIC_CACHE_DISTANCE =
   Number(process.env.SEMANTIC_CACHE_DISTANCE_THRESHOLD || 0.05);
 const VECTOR_CACHE_TTL_MS = 5 * 60 * 1000;
 const VECTOR_CACHE_LIMIT = 100;
+const COLLECTION_GET_BATCH_LIMIT = 10000;
 const LOCAL_HELPER_TIMEOUT_MS = Number(process.env.CHROMA_HELPER_TIMEOUT_MS || 30000);
 const EXPLICIT_CHROMA_MODE = normalizeText(process.env.CHROMA_MODE || 'auto') || 'auto';
 const PYTHON_BIN = String(process.env.CHROMA_PYTHON_BIN || process.env.PYTHON_BIN || '').trim();
@@ -460,7 +461,7 @@ async function queryVectorDbServer(query = '', { k = 5, dbDir = '', collection =
 
 async function getCollectionDocsLocal(
   where = {},
-  { limit = 100, dbDir = '', collection = DEFAULT_COLLECTION } = {}
+  { limit = 100, offset = 0, dbDir = '', collection = DEFAULT_COLLECTION } = {}
 ) {
   const resolvedDbDir = dbDir || resolveDbDir();
   const args = [
@@ -472,6 +473,10 @@ async function getCollectionDocsLocal(
     '--limit',
     String(Math.max(1, Number(limit) || 100))
   ];
+  const cleanOffset = Math.max(0, Number(offset) || 0);
+  if (cleanOffset) {
+    args.push('--offset', String(cleanOffset));
+  }
 
   if (where && typeof where === 'object' && Object.keys(where).length) {
     args.push('--where-json', JSON.stringify(where));
@@ -489,13 +494,14 @@ async function getCollectionDocsLocal(
 
 async function getCollectionDocsServer(
   where = {},
-  { limit = 100, dbDir = '', collection = DEFAULT_COLLECTION } = {}
+  { limit = 100, offset = 0, dbDir = '', collection = DEFAULT_COLLECTION } = {}
 ) {
   const resolvedDbDir = dbDir || resolveDbDir();
   const collectionHandle = await getServerCollectionHandle(collection);
   const payload = await collectionHandle.get({
     where: where && typeof where === 'object' && Object.keys(where).length ? where : undefined,
     limit: Math.max(1, Number(limit) || 100),
+    offset: Math.max(0, Number(offset) || 0),
     include: ['documents', 'metadatas']
   });
   const ids = Array.isArray(payload.ids) ? payload.ids : [];
@@ -511,6 +517,45 @@ async function getCollectionDocsServer(
       document: String(documents[index] || ''),
       metadata: metadatas[index] && typeof metadatas[index] === 'object' ? metadatas[index] : {}
     })),
+    warning: ''
+  };
+}
+
+async function getCollectionDocsPaginated(
+  reader,
+  where = {},
+  { limit = 100, offset = 0, dbDir = '', collection = DEFAULT_COLLECTION } = {}
+) {
+  const resolvedDbDir = dbDir || resolveDbDir();
+  const cleanLimit = Math.max(1, Number(limit) || 100);
+  let remaining = cleanLimit;
+  let nextOffset = Math.max(0, Number(offset) || 0);
+  const docs = [];
+
+  while (remaining > 0) {
+    const batchLimit = Math.min(COLLECTION_GET_BATCH_LIMIT, remaining);
+    const payload = await reader(where, {
+      limit: batchLimit,
+      offset: nextOffset,
+      dbDir: resolvedDbDir,
+      collection
+    });
+    const batchDocs = Array.isArray(payload.docs) ? payload.docs : [];
+    docs.push(...batchDocs);
+
+    if (batchDocs.length < batchLimit) {
+      break;
+    }
+
+    remaining -= batchDocs.length;
+    nextOffset += batchDocs.length;
+  }
+
+  return {
+    available: true,
+    db_dir: resolvedDbDir,
+    collection,
+    docs,
     warning: ''
   };
 }
@@ -590,16 +635,20 @@ async function queryVectorDb(query = '', { k = 5, dbDir = '', collection = DEFAU
 
 async function getCollectionDocs(
   where = {},
-  { limit = 100, dbDir = '', collection = DEFAULT_COLLECTION } = {}
+  { limit = 100, offset = 0, dbDir = '', collection = DEFAULT_COLLECTION } = {}
 ) {
   const resolvedDbDir = dbDir || resolveDbDir();
   const mode = resolveChromaMode({ dbDir: resolvedDbDir });
   const attemptLocalFirst = mode === 'local';
+  const readDocs = attemptLocalFirst ? getCollectionDocsLocal : getCollectionDocsServer;
 
   try {
-    return attemptLocalFirst
-      ? await getCollectionDocsLocal(where, { limit, dbDir: resolvedDbDir, collection })
-      : await getCollectionDocsServer(where, { limit, dbDir: resolvedDbDir, collection });
+    return await getCollectionDocsPaginated(readDocs, where, {
+      limit,
+      offset,
+      dbDir: resolvedDbDir,
+      collection
+    });
   } catch (primaryError) {
     if (attemptLocalFirst) {
       return {
@@ -612,8 +661,9 @@ async function getCollectionDocs(
     }
 
     try {
-      const fallbackPayload = await getCollectionDocsLocal(where, {
+      const fallbackPayload = await getCollectionDocsPaginated(getCollectionDocsLocal, where, {
         limit,
+        offset,
         dbDir: resolvedDbDir,
         collection
       });

@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--collection', default=DEFAULT_COLLECTION)
     parser.add_argument('--where-json', default='')
     parser.add_argument('--limit', type=int, default=10)
+    parser.add_argument('--offset', type=int, default=0)
     parser.add_argument('--input', type=Path, default=None)
     return parser.parse_args()
 
@@ -65,7 +66,11 @@ def do_get(args: argparse.Namespace) -> int:
     client = chromadb.PersistentClient(path=str(args.db_dir.resolve()))
     collection = get_collection(client, args.collection)
     where = parse_where_json(args.where_json)
-    rows = collection.get(where=where, limit=max(1, int(args.limit or 10)))
+    rows = collection.get(
+        where=where,
+        limit=max(1, int(args.limit or 10)),
+        offset=max(0, int(args.offset or 0)),
+    )
     print(
         json.dumps(
             {
