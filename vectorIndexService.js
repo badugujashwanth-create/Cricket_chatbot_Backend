@@ -8,9 +8,9 @@ const {
 } = require('./sqlStatsService');
 
 const INDEX_TTL_MS = 10 * 60 * 1000;
-const PLAYER_LIMIT = 20000;
-const TEAM_LIMIT = 2000;
-const MATCH_LIMIT = 30000;
+const PLAYER_LIMIT = 1000;
+const TEAM_LIMIT = 300;
+const MATCH_LIMIT = 5000;
 
 const cacheState = {
   players: { expiresAt: 0, items: [] },
