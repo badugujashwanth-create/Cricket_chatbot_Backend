@@ -22,7 +22,7 @@ const {
   getCricbuzzPlayerCardByName
 } = require('./cricApiService');
 const { EspnServiceError, getPlayerCareerByQuery } = require('./espnService');
-const { normalizeText } = require('./textUtils');
+const { normalizeText, tokenize } = require('./textUtils');
 const {
   cleanEntitySegment,
   parseVsSides,
@@ -41,6 +41,15 @@ const {
   findMatchesForTeam
 } = require('./vectorIndexService');
 const { lookupKnowledge } = require('./knowledgeService');
+const { getCanonicalPlayerName } = require('./playerMaster');
+const {
+  peekGuidedStructuredContext,
+  mergeNaturalIntentRoutePatches,
+  finalizeCricketResponsePayload,
+  stripCountryEncyclopediaText,
+  extractExplicitCricketTeamName,
+  isFormatComparisonQuestion
+} = require('./naturalIntentGate');
 
 const YEAR_REGEX = /\b(19\d{2}|20\d{2})\b/;
 const MATCH_ID_REGEX = /\b(\d{5,})\b/;
@@ -258,6 +267,23 @@ function extractProperNamePhrases(text = '') {
     'Upcoming Matches'
   ]);
   return uniqueNonEmpty(matches.filter((value) => !blocked.has(String(value || '').trim())));
+}
+
+function cleanPublicCricketText(value = '', fallback = '') {
+  const stripped = stripCountryEncyclopediaText(value);
+  const normalized = normalizeText(stripped);
+  const tokenCount = normalized.split(' ').filter(Boolean).length;
+  if (
+    !stripped ||
+    /^[^\w]+/.test(stripped) ||
+    tokenCount < 5 ||
+    /\bcountry in oceania\b/.test(normalized) ||
+    /\bsovereign country\b/.test(normalized) ||
+    /\blocated in oceania\b/.test(normalized)
+  ) {
+    return String(fallback || '').trim();
+  }
+  return stripped;
 }
 
 function extractDetectedEntitiesFallback(route = {}, data = {}, answer = '', cricApiContext = {}) {
@@ -1525,7 +1551,7 @@ function normalizeRoute(route = {}) {
     player: cleanEntitySegment(pickFirst(merged.player, merged.query)),
     player1: cleanEntitySegment(pickFirst(merged.player1)),
     player2: cleanEntitySegment(pickFirst(merged.player2)),
-    team: cleanEntitySegment(pickFirst(merged.team, merged.query)),
+    team: cleanEntitySegment(pickFirst(merged.team)),
     team1: cleanEntitySegment(pickFirst(merged.team1)),
     team2: cleanEntitySegment(pickFirst(merged.team2)),
     season: pickFirst(merged.season),
@@ -1638,9 +1664,80 @@ async function fetchLivePlayerCandidates(query = '') {
   }
 }
 
+function canonicalAliasPlayerStub(canonicalName = '') {
+  const label = String(canonicalName || '').trim();
+  return {
+    id: '',
+    type: 'player_profile',
+    name: label,
+    canonical_name: label,
+    dataset_name: label,
+    team: '',
+    role: '',
+    matches: 0,
+    runs: 0,
+    average: 0,
+    strike_rate: 0,
+    wickets: 0,
+    economy: 0,
+    fours: 0,
+    sixes: 0,
+    source: 'canonical_alias_fallback',
+    document: ''
+  };
+}
+
 async function resolveEntityStrict(entityType, query = '', { question = '' } = {}) {
-  const cleanQuery = String(query || '').trim();
+  let cleanQuery = String(query || '').trim();
   if (!cleanQuery) return { status: 'missing' };
+
+  let canonicalAliasPlayer = '';
+  if (entityType === 'player') {
+    const stripped = cleanEntitySegment(cleanQuery);
+    let aliasHit =
+      getCanonicalPlayerName(removeGenericWords(stripped)) || getCanonicalPlayerName(stripped);
+    if (!aliasHit) {
+      for (const t of tokenize(stripped)) {
+        const tokenHit = getCanonicalPlayerName(t);
+        if (tokenHit) {
+          aliasHit = tokenHit;
+          break;
+        }
+      }
+    }
+    if (!aliasHit) {
+      const parts = tokenize(stripped);
+      for (let i = 0; i < parts.length - 1; i += 1) {
+        const bigramHit = getCanonicalPlayerName(`${parts[i]} ${parts[i + 1]}`);
+        if (bigramHit) {
+          aliasHit = bigramHit;
+          break;
+        }
+      }
+    }
+    if (aliasHit) {
+      canonicalAliasPlayer = aliasHit;
+      cleanQuery = aliasHit;
+    }
+
+    if (canonicalAliasPlayer) {
+      const players = await loadPlayerProfiles();
+      const needle = normalizeText(canonicalAliasPlayer);
+      const exact = players.find(
+        (player) =>
+          needle === normalizeText(player.canonical_name || player.name) ||
+          needle === normalizeText(player.name || '')
+      );
+      if (exact) {
+        return {
+          status: 'resolved',
+          item: normalizeResolvedEntity(entityType, exact),
+          choices: buildResolutionChoices(entityType, [exact]),
+          score: 1
+        };
+      }
+    }
+  }
 
   const rawResolution =
     entityType === 'team'
@@ -1720,6 +1817,15 @@ async function resolveEntityStrict(entityType, query = '', { question = '' } = {
     // Avoid silently collapsing vague queries onto a famous player or team.
     // If the top fuzzy match is weak or close to the runner-up, force clarification instead.
     if (topScore < 0.72 || secondScore >= topScore - 0.08) {
+      if (entityType === 'player' && canonicalAliasPlayer) {
+        const stub = canonicalAliasPlayerStub(canonicalAliasPlayer);
+        return {
+          status: 'resolved',
+          item: normalizeResolvedEntity(entityType, stub),
+          choices: [canonicalAliasPlayer],
+          score: Math.max(topScore, 0.93)
+        };
+      }
       return {
         status: 'clarify',
         query: cleanQuery,
@@ -1733,6 +1839,16 @@ async function resolveEntityStrict(entityType, query = '', { question = '' } = {
       item: normalizeResolvedEntity(entityType, matches[0]),
       choices,
       score: topScore
+    };
+  }
+
+  if (entityType === 'player' && canonicalAliasPlayer) {
+    const stub = canonicalAliasPlayerStub(canonicalAliasPlayer);
+    return {
+      status: 'resolved',
+      item: normalizeResolvedEntity(entityType, stub),
+      choices: [canonicalAliasPlayer],
+      score: 0.92
     };
   }
 
@@ -2013,11 +2129,25 @@ async function runPlayerAction(action, route, question) {
 }
 
 async function runTeamStats(route, question) {
+  const explicitTeam = String(route.team || '').trim() || extractExplicitCricketTeamName(question);
+  if (!explicitTeam) {
+    return {
+      answer:
+        'I need an explicit team name to show team archive stats. For example, try "India team stats" or "Australia win rate".',
+      data: {
+        type: 'team_stats',
+        title: 'Cricket assistant',
+        team: { name: '' },
+        stats: {}
+      },
+      followups: ['India team stats', 'Australia team stats', 'Show live scores']
+    };
+  }
+
   const { query: teamQuery, resolution } = await resolveEntityWithFallback('team', [
+    explicitTeam,
     route.team,
-    ...buildPhraseCandidates(question),
-    removeGenericWords(question),
-    question
+    ...buildPhraseCandidates(explicitTeam)
   ]);
   if (resolution.status !== 'resolved') {
     return unresolvedEntityResult('team', teamQuery, resolution);
@@ -2364,9 +2494,13 @@ async function runTeamInfo(route, question) {
   const titleStats = buildTeamTitleStats(wikiFields);
   const titleTotal = titleStats.reduce((sum, entry) => sum + Number(entry.wins || 0), 0);
   const iplTitles = titleStats.find((entry) => /\bipl\b|indian premier league/i.test(entry.title));
-  const answer =
+  const wikiAnswer =
     buildTeamInfoAnswerFromWiki(question, team.name, wikiSummary, wikiFields) ||
     `${team.name} have ${formatStatValue(stats.wins)} wins from ${formatStatValue(stats.matches)} archived matches and a win rate of ${formatStatValue(stats.win_rate)}%.`;
+  const statsFallback = `${team.name} have ${formatStatValue(stats.wins)} wins from ${formatStatValue(stats.matches)} archived matches and a win rate of ${formatStatValue(stats.win_rate)}%.`;
+  const answer = cleanPublicCricketText(wikiAnswer, statsFallback);
+  const shortDescription = cleanPublicCricketText(wikiSummary?.description || '');
+  const description = cleanPublicCricketText(wikiSummary?.extract || wikiSummary?.description || '');
 
   return {
     answer,
@@ -2379,8 +2513,8 @@ async function runTeamInfo(route, question) {
         name: team.name,
         image_url: String(wikiSummary?.image || '').trim(),
         wikipedia_url: String(wikiSummary?.wikipedia_url || '').trim(),
-        short_description: String(wikiSummary?.description || '').trim(),
-        description: String(wikiSummary?.extract || wikiSummary?.description || '').trim(),
+        short_description: shortDescription,
+        description,
         captain: String(wikiFields.captain || '').trim(),
         coach: String(wikiFields.coach || '').trim(),
         owner: String(wikiFields.owner || '').trim(),
@@ -2424,6 +2558,8 @@ async function runTeamSquad(route, question, { playingXi = false } = {}) {
   const wikiFields = parseWikipediaInfoboxFields(wikiWikitext);
   const squadPlayers = Array.isArray(squadResult.players) ? squadResult.players : [];
   const totalPlayers = Number(squadResult.totalPlayers || squadPlayers.length || 0);
+  const shortDescription = cleanPublicCricketText(wikiSummary?.description || '');
+  const description = cleanPublicCricketText(wikiSummary?.extract || wikiSummary?.description || '');
 
   if (!squadPlayers.length) {
     return unavailableResult(`I could not find a verified squad list for ${team.name} in the current vector archive.`);
@@ -2443,8 +2579,8 @@ async function runTeamSquad(route, question, { playingXi = false } = {}) {
         name: team.name,
         image_url: String(wikiSummary?.image || '').trim(),
         wikipedia_url: String(wikiSummary?.wikipedia_url || '').trim(),
-        short_description: String(wikiSummary?.description || '').trim(),
-        description: String(wikiSummary?.extract || wikiSummary?.description || '').trim(),
+        short_description: shortDescription,
+        description,
         captain: String(wikiFields.captain || '').trim(),
         coach: String(wikiFields.coach || '').trim(),
         home_ground: String(wikiFields.ground || '').trim()
@@ -2517,6 +2653,22 @@ async function refineRouteForQuestion(route = {}, question = '') {
   const season = toSeason(pickFirst(route.season, guessSeason(question)));
   const format = pickFirst(route.format, guessFormat(question));
 
+  if (isFormatComparisonQuestion(question)) {
+    return {
+      ...route,
+      action: 'general_knowledge',
+      sub_intent: 'format_comparison',
+      player: '',
+      player1: '',
+      player2: '',
+      team: '',
+      team1: '',
+      team2: '',
+      season,
+      format
+    };
+  }
+
   if (vs?.left && vs?.right) {
     const [leftPlayer, rightPlayer, leftTeam, rightTeam] = await Promise.all([
       resolveEntityWithFallback('player', [route.player1, route.player, vs.left], { question }),
@@ -2537,8 +2689,14 @@ async function refineRouteForQuestion(route = {}, question = '') {
       teamsResolved &&
       normalizeText(leftTeam.resolution.item?.name || '') === rawLeft &&
       normalizeText(rightTeam.resolution.item?.name || '') === rawRight;
+    const routerLockedCompare =
+      String(route.action || '').trim() === 'compare_players' && playersResolved;
 
-    if (teamsResolved && (!playersResolved || exactTeamSurface || teamScore >= playerScore + 0.15)) {
+    if (
+      teamsResolved &&
+      (!playersResolved || exactTeamSurface || teamScore >= playerScore + 0.15) &&
+      !routerLockedCompare
+    ) {
       return {
         ...route,
         action: /\bmatch\b|\bscorecard\b|\bsummary\b/.test(normalizedQuestion) ? 'match_summary' : 'head_to_head',
@@ -2569,11 +2727,12 @@ async function refineRouteForQuestion(route = {}, question = '') {
   }
 
   if ((route.action === 'player_stats' || route.action === 'player_season_stats') && !vs) {
+    const explicitTeamMention = extractExplicitCricketTeamName(question) || String(route.team || '').trim();
     const [playerLookup, teamLookup] = await Promise.all([
       resolveEntityWithFallback('player', [route.player, removeGenericWords(question), question], { question }),
       resolveEntityWithFallback('team', [route.team, removeGenericWords(question), question])
     ]);
-    if (isResolved(teamLookup.resolution) && !isResolved(playerLookup.resolution)) {
+    if (explicitTeamMention && isResolved(teamLookup.resolution) && !isResolved(playerLookup.resolution)) {
       return {
         ...route,
         action: 'team_stats',
@@ -3238,22 +3397,24 @@ function buildPublicDetails(
     });
   }
   if (type === 'glossary') {
+    const glossaryAnswer = cleanPublicCricketText(fallbackSummary || structuredContext?.result?.answer || '');
     return withDetectedEntities({
       type,
       title: titleCaseMetric(String(data.term || 'Glossary')),
       subtitle: 'Cricket term',
-      summary: String(structuredContext?.result?.answer || fallbackSummary),
+      summary: glossaryAnswer,
       term: String(data.term || ''),
-      explanation: String(structuredContext?.result?.answer || ''),
+      explanation: glossaryAnswer,
       sources: responseSources
     });
   }
   if (type === 'general_knowledge') {
+    const knowledgeSummary = cleanPublicCricketText(fallbackSummary || structuredContext?.result?.answer || '');
     return withDetectedEntities({
       type,
       title: String(data.title || 'Cricket Knowledge').trim() || 'Cricket Knowledge',
       subtitle: String(data.category || 'Cricket knowledge').trim(),
-      summary: String(structuredContext?.result?.answer || fallbackSummary),
+      summary: knowledgeSummary,
       question: String(data.question || question || '').trim(),
       category: String(data.category || '').trim(),
       related_topics: Array.isArray(data.related_topics) ? data.related_topics.slice(0, 5) : [],
@@ -3768,6 +3929,14 @@ async function executeRouteDataSources(route, question, { onStatus, structuredCo
 }
 
 async function buildStructuredContext(route, question) {
+  const guided = peekGuidedStructuredContext(question);
+  if (guided) {
+    return {
+      ...guided,
+      route: normalizeRoute({ ...route, ...guided.route })
+    };
+  }
+
   const effectiveRoute = await refineRouteForQuestion(route, question);
   if (isGeneralConversationAction(effectiveRoute.action)) {
     return {
@@ -4224,12 +4393,16 @@ async function enrichStructuredResult(structuredContext = {}, route = {}, questi
   if ((type === 'team_stats' || type === 'team_info') && data.team?.name) {
     const wikiSummary = await fetchWikipediaSummary(String(data.team.name || '').trim());
     if (wikiSummary) {
+      const shortDescription = cleanPublicCricketText(data.team.short_description || wikiSummary.description || '');
+      const description = cleanPublicCricketText(
+        data.team.description || wikiSummary.extract || wikiSummary.description || ''
+      );
       data.team = {
         ...data.team,
         image_url: String(data.team.image_url || wikiSummary.image || '').trim(),
         wikipedia_url: String(data.team.wikipedia_url || wikiSummary.wikipedia_url || '').trim(),
-        short_description: String(data.team.short_description || wikiSummary.description || '').trim(),
-        description: String(data.team.description || wikiSummary.extract || wikiSummary.description || '').trim()
+        short_description: shortDescription,
+        description
       };
     }
   }
@@ -4843,8 +5016,9 @@ async function processQuery({ question = '', query = '', sessionId = '' } = {}, 
   const session = getSession(String(sessionId || '').trim());
   const effectiveText = applySessionContext(text, session);
 
+  const baseRoute = normalizeRoute(await routeQuestion(effectiveText, {}));
   const route = applySessionRouteFallback(
-    normalizeRoute(await routeQuestion(effectiveText, {})),
+    normalizeRoute(mergeNaturalIntentRoutePatches(effectiveText, baseRoute)),
     text,
     session
   );
@@ -4915,13 +5089,15 @@ async function processQuery({ question = '', query = '', sessionId = '' } = {}, 
     executionContext
   );
 
+  const synthesizedSafe = finalizeCricketResponsePayload(effectiveText, synthesized, effectiveRoute);
+
   const publicDetails = buildPublicDetails(
     text,
     effectiveRoute,
     structuredContext,
     vectorContext,
     cricApiContext,
-    synthesized,
+    synthesizedSafe,
     espnContext
   );
   syncSessionState(session, effectiveRoute, structuredContext, publicDetails);
@@ -4929,11 +5105,11 @@ async function processQuery({ question = '', query = '', sessionId = '' } = {}, 
   return {
     statusCode: 200,
     response: buildResponse({
-      answer: synthesized.answer,
+      answer: synthesizedSafe.answer,
       data: publicDetails,
       followups:
-        (Array.isArray(synthesized.followups) && synthesized.followups.length
-          ? synthesized.followups
+        (Array.isArray(synthesizedSafe.followups) && synthesizedSafe.followups.length
+          ? synthesizedSafe.followups
           : defaultFollowups(effectiveRoute, structuredContext)
         ).slice(0, 3)
     })
