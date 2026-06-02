@@ -152,10 +152,11 @@ async function runTests() {
     }
   });
 
-  await test('SQLite archive database exists', () => {
-    const dbPath = path.join(__dirname, 'cricket_archive.sqlite3');
-    if (!fs.existsSync(dbPath)) {
-      throw new Error('cricket_archive.sqlite3 not found');
+  await test('Chroma manifest exists when local archive is present', () => {
+    const manifestPath = path.join(__dirname, 'chroma_manifest.json');
+    const dbPath = path.join(__dirname, 'chroma_db');
+    if (fs.existsSync(dbPath) && !fs.existsSync(manifestPath)) {
+      throw new Error('chroma_manifest.json not found for local Chroma archive');
     }
   });
 

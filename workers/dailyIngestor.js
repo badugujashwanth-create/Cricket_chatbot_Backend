@@ -13,14 +13,6 @@ const {
   upsertDocuments
 } = require('../chromaService');
 const { clearVectorIndexCache } = require('../vectorIndexService');
-const {
-  recordCompletedMatch,
-  getPlayerByIdFromSql,
-  getTeamByIdFromSql,
-  getMatchByIdFromSql,
-  extractPlayerDeltasFromMatch,
-  extractTeamTotalsFromMatch
-} = require('../sqlStatsService');
 
 const execFileAsync = promisify(execFile);
 
@@ -133,74 +125,6 @@ async function summarizeMatchNarrative(match = {}) {
   }
 }
 
-function formatNumber(value) {
-  const numeric = Number(value || 0);
-  if (!Number.isFinite(numeric)) return 0;
-  return Number.isInteger(numeric) ? numeric : Number(numeric.toFixed(2));
-}
-
-function buildPlayerDocument(player = {}) {
-  const name = String(player.name || player.canonical_name || '').trim();
-  return {
-    id: String(player.id || '').trim(),
-    document: `Cricket player profile ${name}. Team ${player.team || 'Unknown'}. Role ${
-      player.role || 'Cricketer'
-    }. Indexed matches ${formatNumber(player.matches)}. Runs ${formatNumber(player.runs)}, wickets ${formatNumber(
-      player.wickets
-    )}, batting average ${formatNumber(player.average)}, strike rate ${formatNumber(
-      player.strike_rate
-    )}, bowling economy ${formatNumber(player.economy)}. Fours ${formatNumber(
-      player.fours
-    )}, sixes ${formatNumber(player.sixes)}. Semantic profile tags: ${
-      player.is_active ? 'Active player, live-updated profile.' : 'Archive-backed profile.'
-    }`,
-    metadata: {
-      doc_type: 'player_profile',
-      player: name,
-      team: String(player.team || '').trim(),
-      role: String(player.role || '').trim(),
-      matches: formatNumber(player.matches),
-      runs: formatNumber(player.runs),
-      wickets: formatNumber(player.wickets),
-      average: formatNumber(player.average),
-      strike_rate: formatNumber(player.strike_rate),
-      economy: formatNumber(player.economy),
-      fours: formatNumber(player.fours),
-      sixes: formatNumber(player.sixes),
-      is_active: Boolean(player.is_active),
-      source: 'live_sync'
-    }
-  };
-}
-
-function buildTeamDocument(team = {}) {
-  return {
-    id: String(team.id || '').trim(),
-    document: `Cricket team summary for ${team.name}. Indexed matches ${formatNumber(
-      team.matches
-    )}, wins ${formatNumber(team.wins)}, losses ${formatNumber(team.losses)}, no result ${formatNumber(
-      team.no_result
-    )}, win rate ${formatNumber(team.win_rate)} percent. Total batting runs ${formatNumber(
-      team.runs
-    )}, average score ${formatNumber(team.average_score)}, team strike rate ${formatNumber(
-      team.strike_rate
-    )}.`,
-    metadata: {
-      doc_type: 'team_summary',
-      team: String(team.name || '').trim(),
-      matches: formatNumber(team.matches),
-      wins: formatNumber(team.wins),
-      losses: formatNumber(team.losses),
-      no_result: formatNumber(team.no_result),
-      win_rate: formatNumber(team.win_rate),
-      runs: formatNumber(team.runs),
-      average_score: formatNumber(team.average_score),
-      strike_rate: formatNumber(team.strike_rate),
-      source: 'live_sync'
-    }
-  };
-}
-
 function buildMatchDocument(match = {}) {
   const teams = [String(match.team1 || '').trim(), String(match.team2 || '').trim()].filter(Boolean);
   return {
@@ -219,6 +143,26 @@ function buildMatchDocument(match = {}) {
       winner: String(match.winner || '').trim(),
       source: String(match.source || 'live_sync').trim() || 'live_sync'
     }
+  };
+}
+
+function normalizeMatchDocumentInput(match = {}, narrative = '', sourceLabel = 'CricAPI') {
+  const teams = Array.isArray(match.teams)
+    ? match.teams.map((team) => String(team || '').trim()).filter(Boolean)
+    : [];
+  const team1 = String(match.team1 || teams[0] || '').trim();
+  const team2 = String(match.team2 || teams[1] || '').trim();
+  return {
+    id: String(match.id || '').trim(),
+    name: String(match.name || [team1, team2].filter(Boolean).join(' vs ') || 'Completed match').trim(),
+    date: String(match.date_time_gmt || match.date || '').trim(),
+    match_type: String(match.match_type || match.matchType || match.format || '').trim(),
+    venue: String(match.venue || '').trim(),
+    winner: String(match.match_winner || match.winner || '').trim(),
+    team1,
+    team2,
+    summary: String(narrative || match.summary || match.status || '').trim(),
+    source: sourceLabel
   };
 }
 
@@ -274,51 +218,28 @@ function resolveMatchUrl(matchFeedItem = {}) {
   ).trim();
 }
 
-async function refreshVectorDocsForMatch(match = {}, syncResult = {}) {
-  const basePlayerDeltas = Array.isArray(syncResult.playerDeltas) && syncResult.playerDeltas.length
-    ? syncResult.playerDeltas
-    : extractPlayerDeltasFromMatch(match);
-  const baseTeamDeltas = Array.isArray(syncResult.teamDeltas) && syncResult.teamDeltas.length
-    ? syncResult.teamDeltas
-    : extractTeamTotalsFromMatch(match);
+async function runLiveChromaSync(match = {}, narrative = '', sourceLabel = 'CricAPI') {
+  const matchDoc = buildMatchDocument(
+    normalizeMatchDocumentInput(match, narrative || buildFallbackNarrative(match), sourceLabel)
+  );
+  const result = await upsertDocuments([matchDoc], { collection: CHROMA_COLLECTION });
 
-  const playerDocs = basePlayerDeltas
-    .map((delta) => getPlayerByIdFromSql(delta.id))
-    .filter(Boolean)
-    .map(buildPlayerDocument);
-  const teamDocs = baseTeamDeltas
-    .map((delta) => getTeamByIdFromSql(delta.id))
-    .filter(Boolean)
-    .map(buildTeamDocument);
-  const sqlMatch = getMatchByIdFromSql(match.id);
-  const matchDocs = sqlMatch ? [buildMatchDocument(sqlMatch)] : [];
-  const docs = [...playerDocs, ...teamDocs, ...matchDocs];
-
-  if (docs.length) {
-    await upsertDocuments(docs, { collection: CHROMA_COLLECTION });
+  if (result.ok) {
     clearVectorIndexCache();
     clearVectorQueryCache();
     clearCollectionCache();
   }
 
   return {
-    player_documents: playerDocs.length,
-    team_documents: teamDocs.length,
-    match_documents: matchDocs.length
-  };
-}
-
-async function runLiveSqlVectorSync(match = {}, narrative = '', sourceLabel = 'CricAPI') {
-  const syncResult = recordCompletedMatch(match, { narrative: narrative || buildFallbackNarrative(match) });
-  const docCounts = await refreshVectorDocsForMatch(match, syncResult);
-
-  return {
     match_id: String(match.id || '').trim(),
-    narrative_saved: Boolean(syncResult.applied || syncResult.reason === 'already_synced'),
-    updated_existing: Boolean(syncResult.reason === 'already_synced'),
+    narrative_saved: Boolean(result.ok),
+    updated_existing: false,
     source: sourceLabel,
-    summary: String(syncResult.summary || '').trim(),
-    ...docCounts
+    summary: String(narrative || '').trim(),
+    player_documents: 0,
+    team_documents: 0,
+    match_documents: result.ok ? 1 : 0,
+    warning: String(result.warning || '').trim()
   };
 }
 
@@ -360,7 +281,7 @@ async function ensureMatchIndexed(
   }
 
   const narrative = await summarizeMatchNarrative(matchPayload);
-  return runLiveSqlVectorSync(matchPayload, narrative, provider);
+  return runLiveChromaSync(matchPayload, narrative, provider);
 }
 
 async function ingestCompletedMatch(matchFeedItem = {}, collection = CHROMA_COLLECTION) {

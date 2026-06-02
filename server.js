@@ -8,7 +8,7 @@ const path = require('path');
 const { Server } = require('socket.io');
 const { handleQuery, processQuery } = require('./queryService');
 const { querySemanticCache, saveSemanticCacheEntry, resolveDbDir, readChromaManifest, getChromaHealth } = require('./chromaService');
-const { getSession, clearPendingClarification, setPendingClarification, updateContext } = require('./sessionStore');
+const { getSession, clearPendingClarification, updateContext } = require('./sessionStore');
 const { startDailyIngestor } = require('./workers/dailyIngestor');
 const { getPlayerProfile } = require('./playerProfileService');
 const {
@@ -22,7 +22,6 @@ const {
   findMatchesForTeam,
   getTopPlayersByMetric
 } = require('./vectorIndexService');
-const { seedArchiveSnapshot, getStoreStatus } = require('./sqlStatsService');
 const {
   getLiveScores,
   searchPlayers,
@@ -181,8 +180,7 @@ async function getVectorStatus() {
       matches: Number(manifest?.match_docs || 0)
     },
     summary,
-    chroma_health: chromaHealth,
-    sql_bridge: getStoreStatus()
+    chroma_health: chromaHealth
   };
 }
 
@@ -889,29 +887,6 @@ app.get('*', (req, res) => {
   return res.status(503).send('Frontend build not found. Run the Vite build or dev server.');
 });
 
-async function bootstrapSqlBridge() {
-  try {
-    const [players, teams, matches] = await Promise.all([
-      loadPlayerProfiles(),
-      loadTeamSummaries(),
-      loadMatchSummaries()
-    ]);
-    const manifest = readChromaManifest();
-    const result = seedArchiveSnapshot({
-      players,
-      teams,
-      matches,
-      manifest,
-      force: false
-    });
-    if (result.seeded) {
-      console.log('[sql-bridge] archive snapshot seeded');
-    }
-  } catch (error) {
-    console.warn('[sql-bridge] seed skipped:', error?.message || error);
-  }
-}
-
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
@@ -945,8 +920,7 @@ server.on('error', (error) => {
   process.exit(1);
 });
 
-async function startServer() {
-  await bootstrapSqlBridge();
+function startServer() {
   server.listen(port, () => {
     const address = server.address();
     const activePort =
@@ -958,4 +932,4 @@ async function startServer() {
   });
 }
 
-void startServer();
+startServer();

@@ -1,11 +1,6 @@
 const { getCollectionDocs, queryVectorDb } = require('./chromaService');
 const { normalizeText, similarityScore, tokenize } = require('./textUtils');
 const { buildPlayerAliases, getCanonicalPlayerName } = require('./playerMaster');
-const {
-  mergePlayerWithSql,
-  mergeTeamWithSql,
-  getTopPlayersByMetricFromSql
-} = require('./sqlStatsService');
 
 const INDEX_TTL_MS = 10 * 60 * 1000;
 const PLAYER_LIMIT = 1000;
@@ -53,7 +48,7 @@ function parseString(text = '', pattern) {
   return match ? String(match[1] || '').trim() : '';
 }
 
-function parsePlayerProfile(row = {}, { mergeSql = true } = {}) {
+function parsePlayerProfile(row = {}) {
   const document = String(row.document || '');
   const metadata = row.metadata && typeof row.metadata === 'object' ? row.metadata : {};
   const playerName =
@@ -80,10 +75,10 @@ function parsePlayerProfile(row = {}, { mergeSql = true } = {}) {
     document
   };
 
-  return mergeSql ? mergePlayerWithSql(player) : player;
+  return player;
 }
 
-function parseTeamSummary(row = {}, { mergeSql = true } = {}) {
+function parseTeamSummary(row = {}) {
   const document = String(row.document || '');
   const metadata = row.metadata && typeof row.metadata === 'object' ? row.metadata : {};
   const teamName =
@@ -114,7 +109,7 @@ function parseTeamSummary(row = {}, { mergeSql = true } = {}) {
     document
   };
 
-  return mergeSql ? mergeTeamWithSql(team) : team;
+  return team;
 }
 
 function parseMatchSummary(row = {}) {
@@ -162,7 +157,7 @@ async function loadPlayerProfiles(force = false) {
 async function loadArchivePlayerProfiles() {
   const payload = await getCollectionDocs({ doc_type: 'player_profile' }, { limit: PLAYER_LIMIT });
   return (payload.docs || [])
-    .map((row) => parsePlayerProfile(row, { mergeSql: false }))
+    .map(parsePlayerProfile)
     .filter((item) => item.name);
 }
 
@@ -178,7 +173,7 @@ async function loadTeamSummaries(force = false) {
 async function loadArchiveTeamSummaries() {
   const payload = await getCollectionDocs({ doc_type: 'team_summary' }, { limit: TEAM_LIMIT });
   return (payload.docs || [])
-    .map((row) => parseTeamSummary(row, { mergeSql: false }))
+    .map(parseTeamSummary)
     .filter((item) => item.name);
 }
 
@@ -339,7 +334,26 @@ async function getTeamById(id = '') {
 }
 
 async function getTopPlayersByMetric(metric = 'runs', { limit = 10 } = {}) {
-  return getTopPlayersByMetricFromSql(metric, { limit });
+  const key = String(metric || '').trim();
+  const players = await loadPlayerProfiles();
+  return players
+    .filter((player) => Number.isFinite(Number(player[key])))
+    .sort((left, right) => Number(right[key] || 0) - Number(left[key] || 0) || right.matches - left.matches)
+    .slice(0, Math.max(1, Number(limit) || 10))
+    .map((player, index) => ({
+      rank: index + 1,
+      player: player.canonical_name || player.name,
+      team: player.team,
+      value: Number(player[key] || 0),
+      matches: player.matches,
+      runs: player.runs,
+      average: player.average,
+      strike_rate: player.strike_rate,
+      wickets: player.wickets,
+      economy: player.economy,
+      sixes: player.sixes,
+      fours: player.fours
+    }));
 }
 
 async function getTopPlayersForTeam(teamName = '', metric = 'runs', { limit = 10 } = {}) {

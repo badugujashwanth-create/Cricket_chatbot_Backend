@@ -4,11 +4,6 @@ node_modules/
 .env
 chroma_db/
 chroma_manifest.json
-cricket_archive.sqlite3
-cricket_runtime.sqlite3
-cricket_runtime.sqlite3-shm
-cricket_runtime.sqlite3-wal
-sqlite_manifest.json
 cleaned_balls_all_matches.csv
 cleaned_balls_all_matches.csv.tmp
 cleaned_dataset_manifest.json
